@@ -33,6 +33,7 @@ py -3 -m venv .venv
 pip install --upgrade pip
 pip install fastapi "uvicorn[standard]" pandas openpyxl transformers sentencepiece requests
 pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install python-multipart
 python -m uvicorn app:app --reload
 
 Open http://127.0.0.1:8000
