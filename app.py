@@ -17,6 +17,10 @@ DICT_DIR = os.environ.get("DICT_DIR", "dict")
 DICT_JSONL = os.path.join(DICT_DIR, "nb.jsonl")
 DICT_IDX = os.path.join(DICT_DIR, "nb_idx.json")
 DICT_ASC_IDX = os.path.join(DICT_DIR, "nb_idx_ascii.json")
+DICT_ABBR_IDX = os.path.join(DICT_DIR, "nb_idx_abbr.json")
+DICT_EXT_IDX = os.path.join(DICT_DIR, "nb_idx_ext.json")
+DICT_EXT_ASC = os.path.join(DICT_DIR, "nb_idx_ext_ascii.json")
+EXT_DIR = os.path.join(DICT_DIR, "ext")
 DICT_URL = "https://kaikki.org/dictionary/Norwegian%20Bokm%C3%A5l/kaikki.org-dictionary-NorwegianBokm%C3%A5l.jsonl"
 ART_RE = re.compile(r'^(?:an?|the)\s+', re.I)
 PARENS_RE = re.compile(r'\([^)]*\)')
@@ -25,6 +29,9 @@ BAD_FINAL = {"smal","stor","liten","god","ny","fri"}
 
 _dict_idx = None
 _dict_idx_ascii = None
+_abbr_idx = None
+_ext_idx = None
+_ext_idx_ascii = None
 
 def fold(s):
     return ud.normalize("NFKC", s).strip()
@@ -164,22 +171,24 @@ def rt_score(src, back):
 
 def ensure_nb_dict():
     os.makedirs(DICT_DIR, exist_ok=True)
-    if os.path.exists(DICT_IDX) and os.path.exists(DICT_ASC_IDX):
-        return
-    if not os.path.exists(DICT_JSONL):
-        with requests.get(DICT_URL, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(DICT_JSONL, "wb") as f:
-                for chunk in r.iter_content(1 << 20):
-                    if chunk:
-                        f.write(chunk)
-    build_nb_index()
+    if os.path.exists(DICT_IDX) and os.path.exists(DICT_ASC_IDX) and os.path.exists(DICT_ABBR_IDX):
+        pass
+    else:
+        if not os.path.exists(DICT_JSONL):
+            with requests.get(DICT_URL, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(DICT_JSONL, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        if chunk:
+                            f.write(chunk)
+        build_nb_index()
+    build_ext_indexes()
 
 def clean_gloss(g):
-    g = PARENS_RE.sub('', g or '')
-    g = g.replace(';', ',').split(',')[0]
-    g = ART_RE.sub('', g)
-    g = re.sub(r'\s+', ' ', g).strip()
+    g = PARENS_RE.sub("", g or "")
+    g = g.replace(";", ",").split(",")[0]
+    g = ART_RE.sub("", g)
+    g = re.sub(r"\s+", " ", g).strip()
     return g
 
 def acceptable_gloss(g):
@@ -238,9 +247,18 @@ def extract_best_translation(obj):
             best_rank = key
     return best
 
+def mk_acronym_en(phrase):
+    ws = re.findall(r"[A-Za-z]+", phrase)
+    stop = {"of","and","the","for","to","in","on","at","by","with"}
+    ws = [w for w in ws if w.lower() not in stop]
+    if len(ws) < 2 or len(ws) > 6:
+        return None
+    return "".join(w[0].upper() for w in ws)
+
 def build_nb_index():
     lemma = {}
     aliases = {}
+    abbr = {}
     with open(DICT_JSONL, "r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -251,20 +269,26 @@ def build_nb_index():
             if not w:
                 continue
             k = fold_key(w)
+            senses = obj.get("senses") or []
             g = extract_best_translation(obj)
             if g:
                 prev = lemma.get(k)
                 if prev is None or len(g) < len(prev):
                     lemma[k] = g
-            senses = obj.get("senses") or []
             for s in senses:
                 fos = s.get("form_of") or []
                 for fo in fos:
                     b = fo.get("word")
                     if b:
-                        ak = k
-                        bk = fold_key(b)
-                        aliases.setdefault(ak, set()).add(bk)
+                        aliases.setdefault(k, set()).add(fold_key(b))
+                tags = {t.lower() for t in (s.get("tags") or [])}
+                p = (s.get("pos") or "").lower()
+                if p in {"initialism","acronym","abbreviation"} or any(t in {"initialism","acronym","abbreviation"} for t in tags):
+                    glosses = s.get("glosses") or []
+                    if glosses:
+                        ac = mk_acronym_en(clean_gloss(glosses[0]))
+                        if ac:
+                            abbr[k] = ac
     idx = {}
     for k, g in lemma.items():
         idx[k] = g
@@ -280,41 +304,93 @@ def build_nb_index():
         a = fold_ascii(k)
         if a and (a not in asc or len(g) < len(asc[a])):
             asc[a] = g
+    os.makedirs(DICT_DIR, exist_ok=True)
     with open(DICT_IDX, "w", encoding="utf-8") as f:
         json.dump(idx, f, ensure_ascii=False)
     with open(DICT_ASC_IDX, "w", encoding="utf-8") as f:
         json.dump(asc, f, ensure_ascii=False)
-    global _dict_idx, _dict_idx_ascii
+    with open(DICT_ABBR_IDX, "w", encoding="utf-8") as f:
+        json.dump(abbr, f, ensure_ascii=False)
+    global _dict_idx, _dict_idx_ascii, _abbr_idx
     _dict_idx = idx
     _dict_idx_ascii = asc
+    _abbr_idx = abbr
+
+def build_ext_indexes():
+    os.makedirs(EXT_DIR, exist_ok=True)
+    pairs = {}
+    for name in os.listdir(EXT_DIR):
+        p = os.path.join(EXT_DIR, name)
+        if not os.path.isfile(p):
+            continue
+        if not any(name.lower().endswith(x) for x in [".tsv",".csv",".txt"]):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "\t" in line:
+                        a, b = line.rstrip("\n").split("\t", 1)
+                    elif "," in line:
+                        a, b = line.rstrip("\n").split(",", 1)
+                    else:
+                        continue
+                    a2 = fold_key(a)
+                    b2 = clean_gloss(b)
+                    if a2 and b2:
+                        prev = pairs.get(a2)
+                        if prev is None or len(b2) < len(prev):
+                            pairs[a2] = b2
+        except Exception:
+            continue
+    asc = {}
+    for k, v in pairs.items():
+        a = fold_ascii(k)
+        if a and (a not in asc or len(v) < len(asc[a])):
+            asc[a] = v
+    with open(DICT_EXT_IDX, "w", encoding="utf-8") as f:
+        json.dump(pairs, f, ensure_ascii=False)
+    with open(DICT_EXT_ASC, "w", encoding="utf-8") as f:
+        json.dump(asc, f, ensure_ascii=False)
+    global _ext_idx, _ext_idx_ascii
+    _ext_idx = pairs
+    _ext_idx_ascii = asc
 
 def dict_load():
-    global _dict_idx, _dict_idx_ascii
-    if _dict_idx is not None and _dict_idx_ascii is not None:
+    global _dict_idx, _dict_idx_ascii, _abbr_idx, _ext_idx, _ext_idx_ascii
+    if _dict_idx is not None and _dict_idx_ascii is not None and _abbr_idx is not None and _ext_idx is not None and _ext_idx_ascii is not None:
         return
-    if not os.path.exists(DICT_IDX) or not os.path.exists(DICT_ASC_IDX):
+    if not (os.path.exists(DICT_IDX) and os.path.exists(DICT_ASC_IDX) and os.path.exists(DICT_ABBR_IDX)):
         ensure_nb_dict()
-    if os.path.exists(DICT_IDX):
-        with open(DICT_IDX, "r", encoding="utf-8") as f:
-            _dict_idx = json.load(f)
+    _dict_idx = json.load(open(DICT_IDX, "r", encoding="utf-8")) if os.path.exists(DICT_IDX) else {}
+    _dict_idx_ascii = json.load(open(DICT_ASC_IDX, "r", encoding="utf-8")) if os.path.exists(DICT_ASC_IDX) else {}
+    _abbr_idx = json.load(open(DICT_ABBR_IDX, "r", encoding="utf-8")) if os.path.exists(DICT_ABBR_IDX) else {}
+    if os.path.exists(DICT_EXT_IDX):
+        _ext_idx = json.load(open(DICT_EXT_IDX, "r", encoding="utf-8"))
     else:
-        _dict_idx = {}
-    if os.path.exists(DICT_ASC_IDX):
-        with open(DICT_ASC_IDX, "r", encoding="utf-8") as f:
-            _dict_idx_ascii = json.load(f)
+        _ext_idx = {}
+    if os.path.exists(DICT_EXT_ASC):
+        _ext_idx_ascii = json.load(open(DICT_EXT_ASC, "r", encoding="utf-8"))
     else:
-        _dict_idx_ascii = {}
+        _ext_idx_ascii = {}
 
 def dict_lookup_base_ascii_key(k):
-    v = _dict_idx.get(k)
+    v = (_ext_idx or {}).get(k)
+    if not v:
+        v = (_dict_idx or {}).get(k)
     if not v:
         a = fold_ascii(k)
-        v = _dict_idx_ascii.get(a)
+        v = (_ext_idx_ascii or {}).get(a)
+        if not v:
+            v = (_dict_idx_ascii or {}).get(a)
     return v
 
 def dict_lookup(s):
     dict_load()
     k = fold_key(s)
+    if s.isupper() and 2 <= len(s) <= 6:
+        v2 = (_abbr_idx or {}).get(k)
+        if v2:
+            return v2
     v = dict_lookup_base_ascii_key(k)
     if not v:
         return None
@@ -330,16 +406,18 @@ def is_safe_english_noun(v):
 def dict_fuzzy(s, cutoff=None):
     dict_load()
     key = fold_ascii(s)
-    c = 0.93 if cutoff is None else cutoff
+    c = 0.935 if cutoff is None else cutoff
     if len(key) >= 8:
-        c = min(c, 0.89)
-    matches = difflib.get_close_matches(key, list(_dict_idx_ascii.keys()), n=1, cutoff=c)
+        c = min(c, 0.90)
+    matches = difflib.get_close_matches(key, list((_dict_idx_ascii or {}).keys()), n=1, cutoff=c)
     if not matches:
         return None
     cand = matches[0]
-    if len(key) <= 6 and (key[0] != cand[0] or key[-1] != cand[-1]):
+    if key[0] != cand[0] or key[-1] != cand[-1]:
         return None
-    v = _dict_idx_ascii.get(cand)
+    if abs(len(cand) - len(key)) > 1:
+        return None
+    v = (_dict_idx_ascii or {}).get(cand)
     if not v or not is_safe_english_noun(v):
         return None
     if s.isupper():
@@ -349,7 +427,7 @@ def dict_fuzzy(s, cutoff=None):
     return v
 
 def ascii_close(seg, cutoff):
-    m = difflib.get_close_matches(seg, list(_dict_idx_ascii.keys()), n=1, cutoff=cutoff)
+    m = difflib.get_close_matches(seg, list((_dict_idx_ascii or {}).keys()), n=1, cutoff=cutoff)
     if not m:
         return None
     cand = m[0]
@@ -364,10 +442,9 @@ def seg_score(seg):
         return 0.0, seg, True
     if seg in (_dict_idx_ascii or {}):
         return 0.0, seg, True
-    if seg.endswith('s') and seg[:-1] in (_dict_idx or {}):
-        return 0.1, seg[:-1], True
-    if seg.endswith('s') and seg[:-1] in (_dict_idx_ascii or {}):
-        return 0.1, seg[:-1], True
+    if seg.endswith("s") and (seg[:-1] in (_dict_idx or {}) or seg[:-1] in (_dict_idx_ascii or {})):
+        base = seg[:-1]
+        return 0.1, base, True
     cm = ascii_close(seg, 0.9 if len(seg) >= 6 else 0.94)
     if cm:
         return 0.7, cm, False
@@ -375,48 +452,46 @@ def seg_score(seg):
         return 1.5, seg, False
     return 3.0, seg, False
 
-def strip_leading_article(w):
-    return ART_RE.sub('', w).strip()
 
-def contains_untranslated_upper_token(src, cand):
-    src_toks = re.findall(r'\b[A-ZÆØÅ]{2,4}\b', src)
-    if not src_toks:
-        return False
-    for t in src_toks:
-        if re.search(r'\b' + re.escape(t) + r'\b', cand):
-            return True
-    return False
+def strip_leading_article(w):
+    return ART_RE.sub("", w).strip()
 
 def cand_penalty(c, src):
     p = 0.0
-    if re.match(r'(?i)^\s*(?:a|an|the)\s+', c):
+    if re.match(r"(?i)^\s*(?:a|an|the)\s+", c):
         p -= 0.4
-    if '(' in c or ')' in c:
+    if "(" in c or ")" in c:
         p -= 0.4
+    if " of " in c.lower():
+        p -= 0.5
     if len(c.split()) > 3:
         p -= 0.2
-    if re.search(r'\d', c):
+    if re.search(r"\d", c):
         p -= 0.1
-    if re.match(r'^[A-Z][a-z]+$', c):
+    if re.match(r"^[A-Z][a-z]+$", c):
         p -= 0.2
-    if re.search(r'(?i)(\b\d+\s*mm\b|\bM\d)', src) and re.search(r'(?i)\bmother\b', c):
+    if re.search(r"(?i)(\b\d+\s*mm\b|\bM\d)", src) and re.search(r"(?i)\bmother\b", c):
         p -= 0.6
-    if re.fullmatch(r'[A-Za-z]+', c) and difflib.SequenceMatcher(None, fold_ascii(src), c.lower()).ratio() >= 0.8:
+    if re.fullmatch(r"[A-Za-z]+", c) and difflib.SequenceMatcher(None, fold_ascii(src), c.lower()).ratio() >= 0.8:
         p -= 0.5
-    if re.search(r'(?i)\bto\b', c):
-        p -= 0.35
-    if contains_untranslated_upper_token(src, c):
-        p -= 0.6
+    if re.search(r"(?i)\bto\b", c):
+        p -= 3.0
     if fold_ascii(c) == fold_ascii(src):
         p -= 0.8
+    if contains_untranslated_upper_token(src, c):
+        p -= 0.9
     return p
 
-def nounify_head(w):
-    m = re.match(r'(?i)^(?:to\s+)?([a-z]+)$', w)
-    if not m:
-        return {w}
-    v = m.group(1)
-    return {w, v + "er"}
+
+def nounify_head(w, src_seg):
+    if w.startswith("to "):
+        v = w[3:]
+        if re.fullmatch(r"[a-z]+", v):
+            return {v + "er", v}
+    if src_seg.endswith("er") and re.fullmatch(r"[a-z]+", w) and not w.endswith("er"):
+        return {w, w + "er"}
+    return {w}
+
 
 def compound_candidate(segs, src_code, tgt_code):
     pieces = []
@@ -426,7 +501,7 @@ def compound_candidate(segs, src_code, tgt_code):
             dtry = dict_lookup(seg)
             base_en = dtry if dtry else strip_leading_article(translate_one(seg, src_code, tgt_code, max_new=8, beams=4))
         if i == len(segs) - 1:
-            heads = nounify_head(base_en)
+            heads = nounify_head(base_en, seg)
             return [" ".join(pieces + [h]) for h in heads]
         pieces.append(base_en)
     return [" ".join(pieces)]
@@ -500,46 +575,73 @@ def is_caps_phrase(s):
     return bool(letters) and all(c.isupper() for c in letters)
 
 def is_code_token(tok):
-    if not re.fullmatch(r'[A-Z0-9][A-Z0-9\-/\.]*', tok):
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9\-/\.]*", tok):
         return False
     if tok.isalpha():
         return False
     return fold_ascii(tok) == tok.lower()
 
 def en_tweaks(x):
-    x = re.sub(r'\b([Ss]ilver)\s+plated\b', r'\1-plated', x)
-    x = re.sub(r'\bheat cable\b', 'heating cable', x)
-    x = re.sub(r'\bventilation house\b', 'ventilation housing', x)
-    x = re.sub(r'\bcapsling\b', 'enclosure', x)
-    x = re.sub(r'\bcapsing\b', 'enclosure', x)
+    x = re.sub(r"\b([Ss]ilver)\s+plated\b", r"\1-plated", x)
+    x = re.sub(r"\bheat cable\b", "heating cable", x)
+    x = re.sub(r"\bventilation house\b", "ventilation housing", x)
+    x = re.sub(r"\bcapsling\b", "enclosure", x)
+    x = re.sub(r"\bcapsing\b", "enclosure", x)
+    x = re.sub(r"(?i)\bservo (management|steering)\b", "power steering", x)
     return x
 
 def post_norm(out, src):
     x = out
-    x = re.sub(r'\([^)]*\)', '', x)
-    x = re.sub(r'(?i)\b(\d{1,6})\s*grader\b', r'\1°', x)
-    x = re.sub(r'(?i)\b(\d{1,6})\s*gr\b', r'\1°', x)
-    x = re.sub(r'(?i)\b(\d{1,6})\s*mm\b', r'\1mm', x)
-    x = re.sub(r'(?i)\bnr\.?\b', 'No.', x)
-    x = re.sub(r'No\.\.', 'No.', x)
-    x = re.sub(r'(\d),(\d)', r'\1.\2', x)
-    x = re.sub(r'\s+', ' ', x).strip()
-    x = re.sub(r'(?i)\b(a|an)\s+(a|an)\s+', r'\1 ', x)
-    x = re.sub(r'(?i)^(?:a|an|the)\s+(?=[a-z])', '', x)
+    x = re.sub(r"\([^)]*\)", "", x)
+    x = re.sub(r"(?i)\b(\d{1,6})\s*grader\b", r"\1°", x)
+    x = re.sub(r"(?i)\b(\d{1,6})\s*gr\b", r"\1°", x)
+    x = re.sub(r"(?i)\b(\d{1,6})\s*mm\b", r"\1mm", x)
+    x = re.sub(r"(?i)\bnr\.?\b", "No.", x)
+    x = re.sub(r"No\.\.", "No.", x)
+    x = re.sub(r"(\d),(\d)", r"\1.\2", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    x = re.sub(r"(?i)\b(a|an)\s+(a|an)\s+", r"\1 ", x)
+    x = re.sub(r"(?i)^(?:a|an|the)\s+(?=[a-z])", "", x)
     x = en_tweaks(x)
     if is_caps_phrase(src):
         x = x.upper()
     return x
 
+def upper_tokens(s):
+    return re.findall(r"\b[A-ZÆØÅ]{2,}\b", s)
+
+def contains_untranslated_upper_token(src, cand):
+    toks = set(upper_tokens(src))
+    if not toks:
+        return False
+    words = set(re.findall(r"\b[A-ZÆØÅ]{2,}\b", cand))
+    return bool(toks & words)
+
+def translate_upper_acronym(tok, src_code, tgt_code):
+    if not (tok.isupper() and 2 <= len(tok) <= 6):
+        return None
+    hint = (_abbr_idx or {}).get(fold_key(tok))
+    if hint:
+        return hint
+    cands = translate_k(tok, src_code, tgt_code, k=8)
+    for c in cands:
+        if c.isupper() and 2 <= len(c) <= 6 and c != tok:
+            return c
+    return None
+
 def translate_phrase(s, src_code, tgt_code, dict_first=True):
-    parts = re.split(r'(\W+)', s)
+    parts = re.split(r"(\W+)", s)
     out = []
     for tok in parts:
         if tok == "":
             continue
-        if re.fullmatch(r'[^\W\d_]+', tok, re.UNICODE):
+        if re.fullmatch(r"[^\W\d_]+", tok, re.UNICODE):
             if is_code_token(tok):
                 out.append(tok)
+                continue
+            a = translate_upper_acronym(tok, src_code, tgt_code)
+            if a:
+                out.append(a)
                 continue
             t = None
             if dict_first:
@@ -601,7 +703,7 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
             comp, exact = split_compound(s)
             if comp:
                 try:
-                    dict_cand = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
+                    dict_cand = " ".join(((_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
                     if "" in dict_cand:
                         dict_cand = None
                 except Exception:
@@ -609,6 +711,9 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
         if not dict_cand:
             dict_cand = dict_fuzzy(s)
     cands = []
+    ac = translate_upper_acronym(s, src_code, tgt_code)
+    if ac:
+        cands.append(ac)
     if dict_cand:
         cands.append(strip_leading_article(dict_cand))
     if comp:
@@ -630,7 +735,7 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
             back = ""
         sc = rt_score(s, back) + cand_penalty(c, s)
         if dict_cand and c.lower() == strip_leading_article(dict_cand).lower():
-            sc += 0.8
+            sc += 0.6
         if sc > best_sc:
             best_sc = sc
             best = c
@@ -849,9 +954,7 @@ def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, dict_
                 continue
             if mode == "append_new" and t.strip() != "":
                 continue
-            if dict_first and one_word(s2):
-                todo_texts.append(s2)
-            elif s2 not in cache:
+            if s2 not in cache:
                 todo_texts.append(s2)
             todo_idx.append(i)
         uniq = list(dict.fromkeys(todo_texts))
@@ -862,12 +965,7 @@ def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, dict_
             tgt_code = norm_lang(tgt_lang)
             for i, s in enumerate(uniq, 1):
                 try:
-                    d = dict_lookup(s) if dict_first and one_word(s) else None
-                    if not d and dict_first and one_word(s):
-                        comp, exact = split_compound(s)
-                        if comp and exact:
-                            d = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or seg) for seg in comp)
-                    out = d if d else smart_translate(s, src_code, tgt_code, dict_first)
+                    out = smart_translate(s, src_code, tgt_code, dict_first)
                     cache[s] = out
                 except Exception:
                     cache[s] = ""
