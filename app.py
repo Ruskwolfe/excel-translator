@@ -102,50 +102,87 @@ def norm_lang(x):
         return "nno_Latn"
     return "eng_Latn"
 
-def get_nllb():
-    mid = os.environ.get("MT_MODEL_ID", "facebook/nllb-200-distilled-600M")
-    if mid not in _models:
-        path = model_path(mid)
-        tok = AutoTokenizer.from_pretrained(path)
-        mdl = AutoModelForSeq2SeqLM.from_pretrained(path).to(DEVICE)
-        _models[mid] = (mdl, tok)
-    return _models[mid]
+def get_model_ids():
+    v = os.environ.get("MT_MODEL_IDS", "").strip()
+    if not v:
+        return [os.environ.get("MT_MODEL_ID", "facebook/nllb-200-distilled-600M")]
+    return [x.strip() for x in v.split(",") if x.strip()]
 
-def translate_one(text, src_code, tgt_code, max_new=64, beams=4):
-    mdl, tok = get_nllb()
-    tok.src_lang = src_code
+def load_model(mid):
+    path = model_path(mid)
+    tok = AutoTokenizer.from_pretrained(path)
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(path).to(DEVICE)
+    return mdl, tok
+
+def get_models():
+    ids = get_model_ids()
+    out = []
+    for mid in ids:
+        if mid not in _models:
+            _models[mid] = load_model(mid)
+        out.append((mid, *_models[mid]))
+    return out
+
+def map_m2m(x):
+    x = (x or "").lower().strip()
+    if x.startswith("en"):
+        return "en"
+    if x in ("nb","nob","nob_latn","bokmål","bokmaal","no","nor","norwegian"):
+        return "no"
+    if x in ("nn","nno","nno_latn"):
+        return "no"
+    return x[:2] if len(x) >= 2 else x
+
+def map_nllb(x):
+    x = (x or "").lower().strip()
+    if x.startswith("en"):
+        return "eng_Latn"
+    if x in ("nb","no","nob","norwegian","bokmål","bokmaal"):
+        return "nob_Latn"
+    if x in ("nn","nno"):
+        return "nno_Latn"
+    return x
+
+def model_langs(mid, src_ui, tgt_ui):
+    m = mid.lower()
+    if "m2m100" in m:
+        return map_m2m(src_ui), map_m2m(tgt_ui), "m2m"
+    return map_nllb(src_ui), map_nllb(tgt_ui), "nllb"
+
+def gen_text(mid, mdl, tok, text, src_ui, tgt_ui, max_new=64, beams=4, num_return_sequences=1):
+    src_code, tgt_code, kind = model_langs(mid, src_ui, tgt_ui)
+    if hasattr(tok, "src_lang"):
+        tok.src_lang = src_code
     enc = tok([text], return_tensors="pt", padding=True, truncation=True, max_length=128)
     enc = {k: v.to(DEVICE) for k, v in enc.items()}
+    if kind == "m2m" and hasattr(tok, "get_lang_id"):
+        bos = tok.get_lang_id(tgt_code)
+    else:
+        bos = tok.convert_tokens_to_ids(tgt_code)
     with torch.no_grad():
         gen = mdl.generate(
             **enc,
-            forced_bos_token_id=tok.convert_tokens_to_ids(tgt_code),
+            forced_bos_token_id=bos,
             max_new_tokens=max_new,
             num_beams=beams,
-            do_sample=False,
-            logits_processor=get_logits_processors(tok),
-        )
-    return tok.batch_decode(gen, skip_special_tokens=True)[0]
-
-def translate_k(text, src_code, tgt_code, k=12):
-    mdl, tok = get_nllb()
-    tok.src_lang = src_code
-    enc = tok([text], return_tensors="pt", padding=True, truncation=True, max_length=128)
-    enc = {k2: v.to(DEVICE) for k2, v in enc.items()}
-    with torch.no_grad():
-        gen = mdl.generate(
-            **enc,
-            forced_bos_token_id=tok.convert_tokens_to_ids(tgt_code),
-            max_new_tokens=16,
-            num_beams=max(8, k),
-            num_return_sequences=min(k, max(8, k)),
+            num_return_sequences=num_return_sequences,
             do_sample=False,
             length_penalty=1.0,
-            num_beam_groups=4,
-            diversity_penalty=0.2,
+            num_beam_groups=4 if num_return_sequences > 1 else 1,
+            diversity_penalty=0.2 if num_return_sequences > 1 else 0.0,
             logits_processor=get_logits_processors(tok),
         )
     outs = tok.batch_decode(gen, skip_special_tokens=True)
+    return outs if num_return_sequences > 1 else outs[0]
+
+def translate_one(text, src_code, tgt_code, max_new=64, beams=4):
+    mid, mdl, tok = get_models()[0]
+    return gen_text(mid, mdl, tok, text, src_code, tgt_code, max_new=max_new, beams=beams)
+
+def translate_k(text, src_code, tgt_code, k=12):
+    outs = []
+    for mid, mdl, tok in get_models():
+        outs.extend(gen_text(mid, mdl, tok, text, src_code, tgt_code, max_new=16, beams=max(8, k), num_return_sequences=min(k, max(8, k))))
     seen, uniq = set(), []
     for o in outs:
         o2 = o.strip()
@@ -384,24 +421,35 @@ def dict_lookup_base_ascii_key(k):
             v = (_dict_idx_ascii or {}).get(a)
     return v
 
+def format_casing(src, v):
+    if src.isupper():
+        return v.upper()
+    if len(src) > 1 and src[0].isupper() and src[1:].islower():
+        return v[:1].upper() + v[1:]
+    return v
+
 def dict_lookup(s):
     dict_load()
     k = fold_key(s)
     if s.isupper() and 2 <= len(s) <= 6:
         v2 = (_abbr_idx or {}).get(k)
         if v2:
-            return v2
+            return v2 if v2.isupper() else v2.upper()
+        return s
     v = dict_lookup_base_ascii_key(k)
     if not v:
         return None
-    if s.isupper():
-        return v.upper()
-    if len(s) > 1 and s[0].isupper() and s[1:].islower():
-        return v[:1].upper() + v[1:]
-    return v
+    return format_casing(s, v)
 
-def is_safe_english_noun(v):
-    return v.isalpha() and v == v.lower() and len(v) <= 24
+def is_safe_english_gloss(v):
+    if not v or any(c.isdigit() for c in v):
+        return False
+    toks = re.findall(r"[A-Za-z\-]+", v)
+    if not toks:
+        return False
+    if len(v.split()) > 3:
+        return False
+    return True
 
 def dict_fuzzy(s, cutoff=None):
     dict_load()
@@ -418,13 +466,9 @@ def dict_fuzzy(s, cutoff=None):
     if abs(len(cand) - len(key)) > 1:
         return None
     v = (_dict_idx_ascii or {}).get(cand)
-    if not v or not is_safe_english_noun(v):
+    if not v or not is_safe_english_gloss(v):
         return None
-    if s.isupper():
-        return v.upper()
-    if len(s) > 1 and s[0].isupper() and s[1:].islower():
-        return v[:1].upper() + v[1:]
-    return v
+    return format_casing(s, v)
 
 def ascii_close(seg, cutoff):
     m = difflib.get_close_matches(seg, list((_dict_idx_ascii or {}).keys()), n=1, cutoff=cutoff)
@@ -452,46 +496,76 @@ def seg_score(seg):
         return 1.5, seg, False
     return 3.0, seg, False
 
-
 def strip_leading_article(w):
     return ART_RE.sub("", w).strip()
+
+def upper_tokens(s):
+    return re.findall(r"\b[A-ZÆØÅ]{2,}\b", s)
+
+def contains_untranslated_upper_token(src, cand):
+    toks = set(upper_tokens(src))
+    if not toks:
+        return False
+    words = set(re.findall(r"\b[A-ZÆØÅ]{2,}\b", cand))
+    return bool(toks & words)
 
 def cand_penalty(c, src):
     p = 0.0
     if re.match(r"(?i)^\s*(?:a|an|the)\s+", c):
-        p -= 0.4
-    if "(" in c or ")" in c:
-        p -= 0.4
-    if " of " in c.lower():
         p -= 0.5
+    if "(" in c or ")" in c:
+        p -= 0.5
+    if " of " in c.lower():
+        p -= 1.0
     if len(c.split()) > 3:
-        p -= 0.2
+        p -= 0.25
     if re.search(r"\d", c):
         p -= 0.1
     if re.match(r"^[A-Z][a-z]+$", c):
         p -= 0.2
-    if re.search(r"(?i)(\b\d+\s*mm\b|\bM\d)", src) and re.search(r"(?i)\bmother\b", c):
-        p -= 0.6
-    if re.fullmatch(r"[A-Za-z]+", c) and difflib.SequenceMatcher(None, fold_ascii(src), c.lower()).ratio() >= 0.8:
-        p -= 0.5
+    if re.fullmatch(r"[A-Za-z]+(?: [A-Za-z\-]+){0,2}", c) and difflib.SequenceMatcher(None, fold_ascii(src), c.lower().replace(" ", "")).ratio() >= 0.8:
+        p -= 0.9
     if re.search(r"(?i)\bto\b", c):
         p -= 3.0
-    if fold_ascii(c) == fold_ascii(src):
-        p -= 0.8
     if contains_untranslated_upper_token(src, c):
-        p -= 0.9
+        p -= 1.0
     return p
 
+def nb_last_seg(s):
+    y = fold_ascii(s)
+    n3, _ = split_compound_suffix(y)
+    if n3:
+        return n3[-1]
+    n1, _ = split_compound_dp(y)
+    if n1:
+        return n1[-1]
+    m = re.findall(r"[a-zæøå]+", y)
+    return m[-1] if m else y
+
+def nb_pluralish(seg):
+    return bool(re.search(r"(er|ene|ar|or)$", seg))
+
+def head_mismatch_penalty(src, back):
+    try:
+        hs = nb_last_seg(src)
+        hb = nb_last_seg(back)
+    except Exception:
+        return 0.0
+    if hs == hb:
+        return 0.0
+    if nb_pluralish(hb) and not nb_pluralish(hs) and hb.rstrip("er") == hs:
+        return -0.7
+    return -0.4
 
 def nounify_head(w, src_seg):
     if w.startswith("to "):
         v = w[3:]
-        if re.fullmatch(r"[a-z]+", v):
-            return {v + "er", v}
-    if src_seg.endswith("er") and re.fullmatch(r"[a-z]+", w) and not w.endswith("er"):
-        return {w, w + "er"}
+        if re.fullmatch(r"[a-z\-]+", v):
+            return {v, v + "er"}
+    if src_seg.endswith("er"):
+        if re.fullmatch(r"[a-z\-]+", w) and not w.endswith("er"):
+            return {w, w + "er"}
     return {w}
-
 
 def compound_candidate(segs, src_code, tgt_code):
     pieces = []
@@ -499,7 +573,15 @@ def compound_candidate(segs, src_code, tgt_code):
         base_en = (_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg)
         if not base_en:
             dtry = dict_lookup(seg)
-            base_en = dtry if dtry else strip_leading_article(translate_one(seg, src_code, tgt_code, max_new=8, beams=4))
+            if dtry:
+                base_en = dtry
+            else:
+                if seg.endswith("er") and len(seg) > 2:
+                    dtry2 = dict_lookup(seg[:-1])
+                    if dtry2:
+                        base_en = dtry2
+                if not base_en:
+                    base_en = strip_leading_article(translate_one(seg, src_code, tgt_code, max_new=8, beams=4))
         if i == len(segs) - 1:
             heads = nounify_head(base_en, seg)
             return [" ".join(pieces + [h]) for h in heads]
@@ -600,38 +682,24 @@ def post_norm(out, src):
     x = re.sub(r"No\.\.", "No.", x)
     x = re.sub(r"(\d),(\d)", r"\1.\2", x)
     x = re.sub(r"\s+", " ", x).strip()
-    x = re.sub(r"(?i)\b(a|an)\s+(a|an)\s+", r"\1 ", x)
-    x = re.sub(r"(?i)^(?:a|an|the)\s+(?=[a-z])", "", x)
+    x = re.sub(r"(?i)\b(a|an|the)\s+(?=[a-z])", "", x)
     x = en_tweaks(x)
     if is_caps_phrase(src):
         x = x.upper()
     return x
-
-def upper_tokens(s):
-    return re.findall(r"\b[A-ZÆØÅ]{2,}\b", s)
-
-def contains_untranslated_upper_token(src, cand):
-    toks = set(upper_tokens(src))
-    if not toks:
-        return False
-    words = set(re.findall(r"\b[A-ZÆØÅ]{2,}\b", cand))
-    return bool(toks & words)
 
 def translate_upper_acronym(tok, src_code, tgt_code):
     if not (tok.isupper() and 2 <= len(tok) <= 6):
         return None
     hint = (_abbr_idx or {}).get(fold_key(tok))
     if hint:
-        return hint
-    cands = translate_k(tok, src_code, tgt_code, k=8)
-    for c in cands:
-        if c.isupper() and 2 <= len(c) <= 6 and c != tok:
-            return c
-    return None
+        return hint if hint.isupper() else hint.upper()
+    return tok
 
 def translate_phrase(s, src_code, tgt_code, dict_first=True):
     parts = re.split(r"(\W+)", s)
     out = []
+    used_compound = False
     for tok in parts:
         if tok == "":
             continue
@@ -639,8 +707,12 @@ def translate_phrase(s, src_code, tgt_code, dict_first=True):
             if is_code_token(tok):
                 out.append(tok)
                 continue
+            if tok.isupper() and len(tok) >= 2:
+                result = dict_lookup(tok)
+                out.append(result if result else tok)
+                continue
             a = translate_upper_acronym(tok, src_code, tgt_code)
-            if a:
+            if a and a != tok:
                 out.append(a)
                 continue
             t = None
@@ -650,15 +722,20 @@ def translate_phrase(s, src_code, tgt_code, dict_first=True):
                     comp, exact = split_compound(tok)
                     if comp:
                         pieces = []
-                        ok = True
                         for seg in comp:
                             base_en = (_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg)
                             if not base_en:
-                                ok = False
-                                break
+                                base_en = dict_lookup(seg)
+                            if not base_en and seg.endswith("er") and len(seg) > 2:
+                                base_en = dict_lookup(seg[:-1])
+                            if not base_en:
+                                try:
+                                    base_en = strip_leading_article(translate_one(seg, src_code, tgt_code, max_new=8, beams=4))
+                                except Exception:
+                                    base_en = seg
                             pieces.append(base_en)
-                        if ok:
-                            t = " ".join(pieces)
+                        t = " ".join(pieces)
+                        used_compound = True
                 if not t:
                     tf = dict_fuzzy(tok)
                     if tf:
@@ -683,8 +760,10 @@ def translate_phrase(s, src_code, tgt_code, dict_first=True):
         back_mt = translate_one(mt_all, tgt_code, src_code, max_new=16, beams=4)
     except Exception:
         back_mt = ""
-    sc_word = rt_score(s, back_word) + cand_penalty(wordwise, s)
-    sc_mt = rt_score(s, back_mt) + cand_penalty(mt_all, s)
+    sc_word = rt_score(s, back_word) + cand_penalty(wordwise, s) + head_mismatch_penalty(s, back_word)
+    sc_mt = rt_score(s, back_mt) + cand_penalty(mt_all, s) + head_mismatch_penalty(s, back_mt)
+    if used_compound:
+        sc_word += 0.9
     return wordwise if sc_word >= sc_mt else mt_all
 
 def smart_translate(s, src_code, tgt_code, dict_first=True):
@@ -703,7 +782,7 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
             comp, exact = split_compound(s)
             if comp:
                 try:
-                    dict_cand = " ".join(((_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
+                    dict_cand = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
                     if "" in dict_cand:
                         dict_cand = None
                 except Exception:
@@ -712,7 +791,7 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
             dict_cand = dict_fuzzy(s)
     cands = []
     ac = translate_upper_acronym(s, src_code, tgt_code)
-    if ac:
+    if ac and ac != s:
         cands.append(ac)
     if dict_cand:
         cands.append(strip_leading_article(dict_cand))
@@ -733,9 +812,9 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
             back = translate_one(c, tgt_code, src_code, max_new=8, beams=4)
         except Exception:
             back = ""
-        sc = rt_score(s, back) + cand_penalty(c, s)
+        sc = rt_score(s, back) + cand_penalty(c, s) + head_mismatch_penalty(s, back)
         if dict_cand and c.lower() == strip_leading_article(dict_cand).lower():
-            sc += 0.6
+            sc += 1.2
         if sc > best_sc:
             best_sc = sc
             best = c
@@ -759,8 +838,8 @@ def on_start():
 @app.get("/status")
 def status():
     ds = os.path.getsize(DICT_IDX) if os.path.exists(DICT_IDX) else 0
-    mid = os.environ.get("MT_MODEL_ID", "facebook/nllb-200-distilled-600M")
-    return {"ready": _ready, "downloading": _downloading, "model": mid, "dict_index_bytes": ds}
+    mids = get_model_ids()
+    return {"ready": _ready, "downloading": _downloading, "models": mids, "dict_index_bytes": ds}
 
 @app.post("/clear_cache")
 def clear_cache():
@@ -819,7 +898,7 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
 <body>
 <div id="app" class="container">
   <h1>Excel Column Translator</h1>
-  <div class="notice">Wiktextract EN translations, DP compound split with fuzzy bounds, codes and units preserved</div>
+  <div class="notice">{{ notice }}</div>
   <div class="card">
     <div class="row">
       <input type="file" @change="onFile" accept=".xlsx,.xls" />
@@ -870,26 +949,40 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
       <small>Source: Wiktionary via Wiktextract on kaikki.org</small>
     </div>
   </div>
-  <footer>NLLB-200 600M + Wiktextract + DP splitter</footer>
+  <footer>{{ notice }}</footer>
 </div>
 <script src="https://unpkg.com/vue@3"></script>
 <script>
 const app = Vue.createApp({
-  data(){return{file:null,token:null,sheets:[],sheet:null,columns:[],srcCol:null,tgtCol:null,mode:"append_new",srcLang:"nb",tgtLang:"en",status:"",loading:false,downloading:false,timer:null,jobId:null,progressPct:0,done:0,total:0,stage:"",dictFirst:true}},
-  computed:{readyToTranslate(){return this.token&&this.sheet&&this.srcCol&&this.tgtCol}},
+  data(){return{file:null,token:null,sheets:[],sheet:null,columns:[],srcCol:null,tgtCol:null,mode:"append_new",srcLang:"nb",tgtLang:"en",status:"",loading:false,downloading:false,timer:null,jobId:null,progressPct:0,done:0,total:0,stage:"",dictFirst:true,models:[]}},
+  computed:{
+    readyToTranslate(){return this.token&&this.sheet&&this.srcCol&&this.tgtCol},
+    notice(){const m=this.models&&this.models.length?this.models.join(", "):(this.model||"facebook/nllb-200-distilled-600M");return m+" + Wiktextract + DP splitter"}
+  },
   methods:{
+    async refreshStatus(){try{const r=await fetch("/status");if(!r.ok)return;const j=await r.json();this.models=j.models||[];this.model=j.model||null}catch(e){}},
     onFile(e){this.file=e.target.files[0];this.token=null;this.sheets=[];this.columns=[];this.srcCol=null;this.tgtCol=null},
     async inspect(){if(!this.file)return;this.loading=true;this.status="Inspecting";const fd=new FormData();fd.append("file",this.file);const r=await fetch("/inspect",{method:"POST",body:fd});if(!r.ok){this.status="Failed to read file";this.loading=false;return}const j=await r.json();this.token=j.token;this.sheets=j.sheets;this.sheet=j.sheets[0]||null;this.columns=j.columns||[];this.srcCol=this.columns[0]||null;this.tgtCol=this.srcCol?this.srcCol+"_en":null;this.status="Ready";this.loading=false},
     async fetchColumns(){if(!this.token||!this.sheet)return;this.loading=true;this.status="Loading columns";const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);const r=await fetch("/columns",{method:"POST",body:fd});if(!r.ok){this.status="Failed to load columns";this.loading=false;return}const j=await r.json();this.columns=j.columns||[];if(!this.srcCol)this.srcCol=this.columns[0]||null;this.status="Ready";this.loading=false},
     async start(){this.status="Starting";const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);fd.append("src_col",this.srcCol);fd.append("tgt_col",this.tgtCol);fd.append("src_lang",this.srcLang);fd.append("tgt_lang",this.tgtLang);fd.append("mode",this.mode);fd.append("dict_first",this.dictFirst?"true":"false");const r=await fetch("/start",{method:"POST",body:fd});if(!r.ok){this.status="Failed to start";return}const j=await r.json();this.jobId=j.job;this.status="Translating";this.poll()},
     async poll(){if(!this.jobId)return;const r=await fetch(`/job?job=${this.jobId}`);if(!r.ok){this.status="Job error";return}const j=await r.json();this.stage=j.stage;this.done=j.done;this.total=j.total;this.downloading=j.stage==="downloading";this.progressPct=j.total?Math.min(100,Math.round(100*j.done/j.total)):(j.stage==="done"?100:0);if(j.stage==="done"){const d=await fetch(`/download?job=${this.jobId}`);const blob=await d.blob();const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="translated.xlsx";document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);this.status="Downloaded";this.jobId=null;return}if(j.stage==="error"){this.status=j.error||"Error";this.jobId=null;return}setTimeout(this.poll,500)}
-  }
+  },
+  mounted(){this.refreshStatus()}
 })
 app.mount("#app")
+fetch("/status").then(r=>r.json()).then(j=>{
+  const m = (j.models && j.models.length ? j.models.join(", ") : (j.model || "facebook/nllb-200-distilled-600M"));
+  const txt = m + " + Wiktextract + DP splitter";
+  const b = document.getElementById("banner");
+  const f = document.getElementById("footer");
+  if (b) b.textContent = txt;
+  if (f) f.textContent = txt;
+});
 </script>
 </body>
 </html>
 """
+
 
 @app.post("/inspect")
 async def inspect(file: UploadFile):
