@@ -1,7 +1,7 @@
 import io, uuid, os, json, re, unicodedata as ud, difflib, pandas as pd, torch, threading, requests
 from fastapi import FastAPI, UploadFile, Form, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
 
 app = FastAPI()
 _files = {}
@@ -18,6 +18,10 @@ DICT_JSONL = os.path.join(DICT_DIR, "nb.jsonl")
 DICT_IDX = os.path.join(DICT_DIR, "nb_idx.json")
 DICT_ASC_IDX = os.path.join(DICT_DIR, "nb_idx_ascii.json")
 DICT_URL = "https://kaikki.org/dictionary/Norwegian%20Bokm%C3%A5l/kaikki.org-dictionary-NorwegianBokm%C3%A5l.jsonl"
+ART_RE = re.compile(r'^(?:an?|the)\s+', re.I)
+PARENS_RE = re.compile(r'\([^)]*\)')
+HEADS = {"skive","hjul","lampe","mal","senter","styring","sliper","skjerm","hylle","mutter","maskin","hus","boks","kabel","plugg","bolt","skrue","ror","ventil","kontakt","sensor","pumpe","motor","plate","holder","verktoy","ledning","panel"}
+BAD_FINAL = {"smal","stor","liten","god","ny","fri"}
 
 _dict_idx = None
 _dict_idx_ascii = None
@@ -46,6 +50,43 @@ def model_path(mid):
     local = os.path.join(MODEL_ROOT, *mid.split("/"))
     return local if os.path.isdir(local) else mid
 
+_ban_cache = {}
+
+class BanAtStart(LogitsProcessor):
+    def __init__(self, ids):
+        self.ids = set(i for i in ids if i is not None)
+    def __call__(self, input_ids, scores):
+        if input_ids.shape[1] == 1 and self.ids:
+            scores[:, list(self.ids)] = -1e9
+        return scores
+
+class BanAlways(LogitsProcessor):
+    def __init__(self, ids):
+        self.ids = set(i for i in ids if i is not None)
+    def __call__(self, input_ids, scores):
+        if self.ids:
+            scores[:, list(self.ids)] = -1e9
+        return scores
+
+def build_bans(tok):
+    start = []
+    for s in [" a", " an", " the"]:
+        ids = tok.encode(s, add_special_tokens=False)
+        if len(ids) == 1:
+            start.append(ids[0])
+    anyt = []
+    for s in ["(", " (", ")", " )"]:
+        ids = tok.encode(s, add_special_tokens=False)
+        anyt.extend(ids)
+    return list(dict.fromkeys(start)), list(dict.fromkeys(anyt))
+
+def get_logits_processors(tok):
+    k = id(tok)
+    if k not in _ban_cache:
+        s, a = build_bans(tok)
+        _ban_cache[k] = LogitsProcessorList([BanAtStart(s), BanAlways(a)])
+    return _ban_cache[k]
+
 def norm_lang(x):
     x = (x or "").lower().strip()
     if x in ("nb", "no"):
@@ -55,7 +96,7 @@ def norm_lang(x):
     return "eng_Latn"
 
 def get_nllb():
-    mid = "facebook/nllb-200-distilled-600M"
+    mid = os.environ.get("MT_MODEL_ID", "facebook/nllb-200-distilled-600M")
     if mid not in _models:
         path = model_path(mid)
         tok = AutoTokenizer.from_pretrained(path)
@@ -69,7 +110,14 @@ def translate_one(text, src_code, tgt_code, max_new=64, beams=4):
     enc = tok([text], return_tensors="pt", padding=True, truncation=True, max_length=128)
     enc = {k: v.to(DEVICE) for k, v in enc.items()}
     with torch.no_grad():
-        gen = mdl.generate(**enc, forced_bos_token_id=tok.convert_tokens_to_ids(tgt_code), max_new_tokens=max_new, num_beams=beams, do_sample=False)
+        gen = mdl.generate(
+            **enc,
+            forced_bos_token_id=tok.convert_tokens_to_ids(tgt_code),
+            max_new_tokens=max_new,
+            num_beams=beams,
+            do_sample=False,
+            logits_processor=get_logits_processors(tok),
+        )
     return tok.batch_decode(gen, skip_special_tokens=True)[0]
 
 def translate_k(text, src_code, tgt_code, k=12):
@@ -88,6 +136,7 @@ def translate_k(text, src_code, tgt_code, k=12):
             length_penalty=1.0,
             num_beam_groups=4,
             diversity_penalty=0.2,
+            logits_processor=get_logits_processors(tok),
         )
     outs = tok.batch_decode(gen, skip_special_tokens=True)
     seen, uniq = set(), []
@@ -127,17 +176,16 @@ def ensure_nb_dict():
     build_nb_index()
 
 def clean_gloss(g):
-    g = re.sub(r"\([^)]*\)", "", g)
-    g = g.strip()
-    g = g.split(";")[0].split(",")[0]
-    g = g.replace("to ", "").strip()
-    g = re.sub(r"\s+", " ", g)
+    g = PARENS_RE.sub('', g or '')
+    g = g.replace(';', ',').split(',')[0]
+    g = ART_RE.sub('', g)
+    g = re.sub(r'\s+', ' ', g).strip()
     return g
 
 def acceptable_gloss(g):
     if not g:
         return False
-    wl = g.lower().split()
+    wl = g.split()
     if len(wl) > 3:
         return False
     if any(c.isdigit() for c in g):
@@ -150,21 +198,26 @@ def acceptable_gloss(g):
     return True
 
 def extract_best_translation(obj):
-    pos_order = ["noun", "proper-noun", "adjective", "verb", "adverb", "pronoun", "numeral", "name"]
+    pos_order = ["noun", "adjective", "verb", "adverb", "pronoun", "numeral", "name"]
     senses = obj.get("senses") or []
     best = None
     best_rank = (10, 999)
     for s in senses:
+        p = (s.get("pos") or "").lower()
+        if p == "proper-noun":
+            continue
         if s.get("form_of"):
             continue
         trs = s.get("translations") or []
         for t in trs:
             if (t.get("lang") or "").lower() != "english":
                 continue
+            tags = [x.lower() for x in (t.get("tags") or [])]
+            if any(x in {"name", "proper"} for x in tags):
+                continue
             w = clean_gloss(t.get("word") or "")
             if not acceptable_gloss(w):
                 continue
-            p = s.get("pos") or ""
             rank = pos_order.index(p) if p in pos_order else len(pos_order) + 1
             key = (rank, len(w))
             if key < best_rank:
@@ -178,7 +231,6 @@ def extract_best_translation(obj):
         g = clean_gloss(gl[0])
         if not acceptable_gloss(g):
             continue
-        p = s.get("pos") or ""
         rank = pos_order.index(p) if p in pos_order else len(pos_order) + 1
         key = (rank, len(g))
         if key < best_rank:
@@ -272,20 +324,23 @@ def dict_lookup(s):
         return v[:1].upper() + v[1:]
     return v
 
+def is_safe_english_noun(v):
+    return v.isalpha() and v == v.lower() and len(v) <= 24
+
 def dict_fuzzy(s, cutoff=None):
     dict_load()
     key = fold_ascii(s)
-    c = 0.92 if cutoff is None else cutoff
+    c = 0.93 if cutoff is None else cutoff
     if len(key) >= 8:
-        c = min(c, 0.87)
+        c = min(c, 0.89)
     matches = difflib.get_close_matches(key, list(_dict_idx_ascii.keys()), n=1, cutoff=c)
     if not matches:
         return None
     cand = matches[0]
-    if len(key) >= 5 and (key[0] != cand[0] or key[-1] != cand[-1]):
+    if len(key) <= 6 and (key[0] != cand[0] or key[-1] != cand[-1]):
         return None
     v = _dict_idx_ascii.get(cand)
-    if not v:
+    if not v or not is_safe_english_noun(v):
         return None
     if s.isupper():
         return v.upper()
@@ -305,14 +360,76 @@ def ascii_close(seg, cutoff):
     return cand
 
 def seg_score(seg):
-    if seg in _dict_idx_ascii:
+    if seg in (_dict_idx or {}):
         return 0.0, seg, True
+    if seg in (_dict_idx_ascii or {}):
+        return 0.0, seg, True
+    if seg.endswith('s') and seg[:-1] in (_dict_idx or {}):
+        return 0.1, seg[:-1], True
+    if seg.endswith('s') and seg[:-1] in (_dict_idx_ascii or {}):
+        return 0.1, seg[:-1], True
     cm = ascii_close(seg, 0.9 if len(seg) >= 6 else 0.94)
     if cm:
         return 0.7, cm, False
     if len(seg) <= 4:
         return 1.5, seg, False
     return 3.0, seg, False
+
+def strip_leading_article(w):
+    return ART_RE.sub('', w).strip()
+
+def contains_untranslated_upper_token(src, cand):
+    src_toks = re.findall(r'\b[A-ZÆØÅ]{2,4}\b', src)
+    if not src_toks:
+        return False
+    for t in src_toks:
+        if re.search(r'\b' + re.escape(t) + r'\b', cand):
+            return True
+    return False
+
+def cand_penalty(c, src):
+    p = 0.0
+    if re.match(r'(?i)^\s*(?:a|an|the)\s+', c):
+        p -= 0.4
+    if '(' in c or ')' in c:
+        p -= 0.4
+    if len(c.split()) > 3:
+        p -= 0.2
+    if re.search(r'\d', c):
+        p -= 0.1
+    if re.match(r'^[A-Z][a-z]+$', c):
+        p -= 0.2
+    if re.search(r'(?i)(\b\d+\s*mm\b|\bM\d)', src) and re.search(r'(?i)\bmother\b', c):
+        p -= 0.6
+    if re.fullmatch(r'[A-Za-z]+', c) and difflib.SequenceMatcher(None, fold_ascii(src), c.lower()).ratio() >= 0.8:
+        p -= 0.5
+    if re.search(r'(?i)\bto\b', c):
+        p -= 0.35
+    if contains_untranslated_upper_token(src, c):
+        p -= 0.6
+    if fold_ascii(c) == fold_ascii(src):
+        p -= 0.8
+    return p
+
+def nounify_head(w):
+    m = re.match(r'(?i)^(?:to\s+)?([a-z]+)$', w)
+    if not m:
+        return {w}
+    v = m.group(1)
+    return {w, v + "er"}
+
+def compound_candidate(segs, src_code, tgt_code):
+    pieces = []
+    for i, seg in enumerate(segs):
+        base_en = (_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg)
+        if not base_en:
+            dtry = dict_lookup(seg)
+            base_en = dtry if dtry else strip_leading_article(translate_one(seg, src_code, tgt_code, max_new=8, beams=4))
+        if i == len(segs) - 1:
+            heads = nounify_head(base_en)
+            return [" ".join(pieces + [h]) for h in heads]
+        pieces.append(base_en)
+    return [" ".join(pieces)]
 
 def split_compound_dp(y, max_seg=24):
     n = len(y)
@@ -330,7 +447,13 @@ def split_compound_dp(y, max_seg=24):
                 continue
             cost, base, exact = seg_score(seg)
             prev_cost, prev_segs = dp[i]
-            cand_cost = prev_cost + cost + 0.05
+            adj = 0.0
+            if j == n:
+                if base in HEADS:
+                    adj -= 0.35
+                if base in BAD_FINAL:
+                    adj += 0.6
+            cand_cost = prev_cost + cost + 0.05 + adj
             cand_list = prev_segs + [base]
             if dp[j] is None or cand_cost < dp[j][0]:
                 dp[j] = (cand_cost, cand_list)
@@ -342,6 +465,12 @@ def split_compound_dp(y, max_seg=24):
     if len(segs) < 2:
         return None, False
     return segs, exact
+
+def split_compound_suffix(y):
+    for h in sorted(HEADS, key=len, reverse=True):
+        if y.endswith(h) and len(y) > len(h) + 1:
+            return [y[: len(y) - len(h)], h], False
+    return None, False
 
 def split_compound(w):
     dict_load()
@@ -361,6 +490,9 @@ def split_compound(w):
         return n1, e1
     if n2:
         return n2, e2
+    n3, e3 = split_compound_suffix(y)
+    if n3:
+        return n3, e3
     return None, False
 
 def is_caps_phrase(s):
@@ -368,7 +500,11 @@ def is_caps_phrase(s):
     return bool(letters) and all(c.isupper() for c in letters)
 
 def is_code_token(tok):
-    return bool(re.fullmatch(r'[A-Z0-9][A-Z0-9\-/\.]*', tok)) and fold_ascii(tok) == tok.lower()
+    if not re.fullmatch(r'[A-Z0-9][A-Z0-9\-/\.]*', tok):
+        return False
+    if tok.isalpha():
+        return False
+    return fold_ascii(tok) == tok.lower()
 
 def en_tweaks(x):
     x = re.sub(r'\b([Ss]ilver)\s+plated\b', r'\1-plated', x)
@@ -388,6 +524,8 @@ def post_norm(out, src):
     x = re.sub(r'No\.\.', 'No.', x)
     x = re.sub(r'(\d),(\d)', r'\1.\2', x)
     x = re.sub(r'\s+', ' ', x).strip()
+    x = re.sub(r'(?i)\b(a|an)\s+(a|an)\s+', r'\1 ', x)
+    x = re.sub(r'(?i)^(?:a|an|the)\s+(?=[a-z])', '', x)
     x = en_tweaks(x)
     if is_caps_phrase(src):
         x = x.upper()
@@ -404,7 +542,6 @@ def translate_phrase(s, src_code, tgt_code, dict_first=True):
                 out.append(tok)
                 continue
             t = None
-            fuzzy_used = False
             if dict_first:
                 t = dict_lookup(tok)
                 if not t:
@@ -413,7 +550,7 @@ def translate_phrase(s, src_code, tgt_code, dict_first=True):
                         pieces = []
                         ok = True
                         for seg in comp:
-                            base_en = _dict_idx_ascii.get(seg)
+                            base_en = (_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg)
                             if not base_en:
                                 ok = False
                                 break
@@ -424,17 +561,29 @@ def translate_phrase(s, src_code, tgt_code, dict_first=True):
                     tf = dict_fuzzy(tok)
                     if tf:
                         t = tf
-                        fuzzy_used = True
             if not t:
                 if one_word(tok):
                     t = translate_one(tok, src_code, tgt_code)
                 else:
                     t = tok
+            if one_word(tok):
+                t = strip_leading_article(t)
             out.append(t)
         else:
             out.append(tok)
-    res = "".join(out)
-    return post_norm(res, s)
+    wordwise = post_norm("".join(out), s)
+    mt_all = post_norm(translate_one(s, src_code, tgt_code), s)
+    try:
+        back_word = translate_one(wordwise, tgt_code, src_code, max_new=16, beams=4)
+    except Exception:
+        back_word = ""
+    try:
+        back_mt = translate_one(mt_all, tgt_code, src_code, max_new=16, beams=4)
+    except Exception:
+        back_mt = ""
+    sc_word = rt_score(s, back_word) + cand_penalty(wordwise, s)
+    sc_mt = rt_score(s, back_mt) + cand_penalty(mt_all, s)
+    return wordwise if sc_word >= sc_mt else mt_all
 
 def smart_translate(s, src_code, tgt_code, dict_first=True):
     if " " in s.strip():
@@ -443,32 +592,45 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
         return post_norm(translate_one(s, src_code, tgt_code), s)
     if len(s.strip()) <= 3 and not re.search(r"[A-Za-zÆØÅæøå]", s):
         return s
-    d = None
+    dict_cand = None
+    comp = None
+    exact = False
     if dict_first:
-        d = dict_lookup(s)
-        if not d:
+        dict_cand = dict_lookup(s)
+        if not dict_cand:
             comp, exact = split_compound(s)
-            if comp and exact:
-                d = " ".join(_dict_idx_ascii.get(seg) or seg for seg in comp)
-        if not d:
-            d = dict_fuzzy(s)
-    if d:
-        return post_norm(d, s)
-    cands = translate_k(s, src_code, tgt_code, k=12)
-    if not cands:
-        return post_norm(translate_one(s, src_code, tgt_code), s)
+            if comp:
+                try:
+                    dict_cand = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
+                    if "" in dict_cand:
+                        dict_cand = None
+                except Exception:
+                    dict_cand = None
+        if not dict_cand:
+            dict_cand = dict_fuzzy(s)
+    cands = []
+    if dict_cand:
+        cands.append(strip_leading_article(dict_cand))
+    if comp:
+        try:
+            cands.extend(compound_candidate(comp, src_code, tgt_code))
+        except Exception:
+            pass
+    mt = translate_k(s, src_code, tgt_code, k=12) or [translate_one(s, src_code, tgt_code)]
+    for c in mt:
+        if one_word(s):
+            c = strip_leading_article(c)
+        cands.append(c)
     best = None
-    best_sc = -1.0
-    for c in cands:
+    best_sc = -1e9
+    for c in dict.fromkeys([post_norm(x, s) for x in cands if x]):
         try:
             back = translate_one(c, tgt_code, src_code, max_new=8, beams=4)
         except Exception:
             back = ""
-        sc = rt_score(s, back)
-        if " " in c:
-            sc -= 0.3
-        if not s.lower().endswith("s") and c.lower().endswith("s"):
-            sc -= 0.2
+        sc = rt_score(s, back) + cand_penalty(c, s)
+        if dict_cand and c.lower() == strip_leading_article(dict_cand).lower():
+            sc += 0.8
         if sc > best_sc:
             best_sc = sc
             best = c
@@ -492,7 +654,8 @@ def on_start():
 @app.get("/status")
 def status():
     ds = os.path.getsize(DICT_IDX) if os.path.exists(DICT_IDX) else 0
-    return {"ready": _ready, "downloading": _downloading, "model": "facebook/nllb-200-distilled-600M", "dict_index_bytes": ds}
+    mid = os.environ.get("MT_MODEL_ID", "facebook/nllb-200-distilled-600M")
+    return {"ready": _ready, "downloading": _downloading, "model": mid, "dict_index_bytes": ds}
 
 @app.post("/clear_cache")
 def clear_cache():
@@ -703,7 +866,7 @@ def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, dict_
                     if not d and dict_first and one_word(s):
                         comp, exact = split_compound(s)
                         if comp and exact:
-                            d = " ".join(_dict_idx_ascii.get(seg) or seg for seg in comp)
+                            d = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or seg) for seg in comp)
                     out = d if d else smart_translate(s, src_code, tgt_code, dict_first)
                     cache[s] = out
                 except Exception:
