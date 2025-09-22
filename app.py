@@ -2,8 +2,8 @@ import io, uuid, os, json, re, unicodedata as ud, difflib, pandas as pd, torch, 
 from fastapi import FastAPI, UploadFile, Form, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
+from contextlib import asynccontextmanager
 
-app = FastAPI()
 _files = {}
 _models = {}
 _jobs = {}
@@ -26,6 +26,7 @@ ART_RE = re.compile(r'^(?:an?|the)\s+', re.I)
 PARENS_RE = re.compile(r'\([^)]*\)')
 HEADS = {"skive","hjul","lampe","mal","senter","styring","sliper","skjerm","hylle","mutter","maskin","hus","boks","kabel","plugg","bolt","skrue","ror","ventil","kontakt","sensor","pumpe","motor","plate","holder","verktoy","ledning","panel"}
 BAD_FINAL = {"smal","stor","liten","god","ny","fri"}
+FAST_BATCH = int(os.environ.get("MT_BATCH", "128"))
 
 _dict_idx = None
 _dict_idx_ascii = None
@@ -53,6 +54,13 @@ def save_cache(c):
     with open(_cache_path, "w", encoding="utf-8") as f:
         json.dump(c, f, ensure_ascii=False)
 
+def clear_cache_file():
+    try:
+        if os.path.exists(_cache_path):
+            os.remove(_cache_path)
+    except Exception:
+        pass
+
 def model_path(mid):
     local = os.path.join(MODEL_ROOT, *mid.split("/"))
     return local if os.path.isdir(local) else mid
@@ -77,15 +85,16 @@ class BanAlways(LogitsProcessor):
 
 def build_bans(tok):
     start = []
-    for s in [" a", " an", " the"]:
+    for s in [" a", " an", " the", " is", " was", " are", " were", " also", " called", " known"]:
         ids = tok.encode(s, add_special_tokens=False)
         if len(ids) == 1:
             start.append(ids[0])
     anyt = []
-    for s in ["(", " (", ")", " )"]:
+    for s in ["(", " (", ")", " )", " also known", " sometimes", " commonly", " called", " available", " born", " was", " were"]:
         ids = tok.encode(s, add_special_tokens=False)
         anyt.extend(ids)
     return list(dict.fromkeys(start)), list(dict.fromkeys(anyt))
+
 
 def get_logits_processors(tok):
     k = id(tok)
@@ -102,16 +111,110 @@ def norm_lang(x):
         return "nno_Latn"
     return "eng_Latn"
 
+def default_model():
+    return "facebook/nllb-200-1.3B" if DEVICE == "cuda" else "facebook/nllb-200-distilled-600M"
+
 def get_model_ids():
     v = os.environ.get("MT_MODEL_IDS", "").strip()
-    if not v:
-        return [os.environ.get("MT_MODEL_ID", "facebook/nllb-200-distilled-600M")]
-    return [x.strip() for x in v.split(",") if x.strip()]
+    if v:
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return [
+        "Helsinki-NLP/opus-mt-tc-big-gmq-en",
+        ("facebook/nllb-200-1.3B" if DEVICE == "cuda" else "facebook/nllb-200-distilled-600M"),
+        "facebook/m2m100_1.2B",
+    ]
+
+def batch_gen(mid, mdl, tok, texts, src_ui, tgt_ui, max_new=10, beams=6):
+    src_code, tgt_code, kind = model_langs(mid, src_ui, tgt_ui)
+    if hasattr(tok, "src_lang"):
+        tok.src_lang = src_code
+    enc = tok(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+    enc = {k: v.to(DEVICE) for k, v in enc.items()}
+    bos = None
+    if kind == "m2m" and hasattr(tok, "get_lang_id"):
+        bos = tok.get_lang_id(map_m2m(tgt_ui))
+    elif kind == "nllb":
+        bos = tok.convert_tokens_to_ids(map_nllb(tgt_ui))
+    with torch.no_grad():
+        kwargs = dict(
+            **enc,
+            max_new_tokens=max_new,
+            min_new_tokens=1,
+            num_beams=beams,
+            do_sample=False,
+            length_penalty=1.0,
+            no_repeat_ngram_size=2,
+            logits_processor=get_logits_processors(tok),
+            early_stopping=True,
+        )
+        if bos is not None:
+            kwargs["forced_bos_token_id"] = bos
+        out_ids = mdl.generate(**kwargs)
+    outs = tok.batch_decode(out_ids, skip_special_tokens=True)
+    return [post_norm(o, t) for o, t in zip(outs, texts)]
+
+def translate_many(texts, src_code, tgt_code, dict_first=True, batch_size=FAST_BATCH):
+    primary = get_models()[0]
+    mid, mdl, tok = primary
+    results = [None] * len(texts)
+    mt_queue = []
+    mt_idx = []
+    for i, s in enumerate(texts):
+        z = s.strip()
+        if z == "":
+            results[i] = ""
+            continue
+        if is_code_token(z):
+            results[i] = z
+            continue
+        if z.isupper() and 2 <= len(z) <= 6:
+            a = translate_upper_acronym(z, src_code, tgt_code)
+            results[i] = a if a else z
+            continue
+        if " " in z:
+            mt_queue.append(z)
+            mt_idx.append(i)
+            continue
+        if dict_first:
+            d = dict_lookup(z)
+            if not d:
+                comp, exact = split_compound(z)
+                if comp:
+                    try:
+                        d = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
+                        if "" in d:
+                            d = None
+                    except Exception:
+                        d = None
+            if not d:
+                d = dict_fuzzy(z)
+            if d:
+                results[i] = strip_leading_article(d)
+                continue
+        mt_queue.append(z)
+        mt_idx.append(i)
+    for j in range(0, len(mt_queue), batch_size):
+        chunk = mt_queue[j:j+batch_size]
+        outs = batch_gen(mid, mdl, tok, chunk, src_code, tgt_code, max_new=10, beams=6)
+        for k, out in enumerate(outs):
+            idx = mt_idx[j+k]
+            if one_word(texts[idx]):
+                out = enforce_single_term(texts[idx], out)
+            results[idx] = out
+    return results
+
+
 
 def load_model(mid):
     path = model_path(mid)
-    tok = AutoTokenizer.from_pretrained(path)
-    mdl = AutoModelForSeq2SeqLM.from_pretrained(path).to(DEVICE)
+    tok = AutoTokenizer.from_pretrained(path, token=False)
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(path, token=False)
+    if DEVICE == "cuda":
+        try:
+            mdl = mdl.half()
+        except Exception:
+            pass
+    mdl = mdl.to(DEVICE)
     return mdl, tok
 
 def get_models():
@@ -119,8 +222,14 @@ def get_models():
     out = []
     for mid in ids:
         if mid not in _models:
-            _models[mid] = load_model(mid)
-        out.append((mid, *_models[mid]))
+            try:
+                _models[mid] = load_model(mid)
+            except Exception:
+                _models[mid] = None
+        if _models[mid] is not None:
+            out.append((mid, *_models[mid]))
+    if not out:
+        raise RuntimeError("No models available")
     return out
 
 def map_m2m(x):
@@ -147,42 +256,68 @@ def model_langs(mid, src_ui, tgt_ui):
     m = mid.lower()
     if "m2m100" in m:
         return map_m2m(src_ui), map_m2m(tgt_ui), "m2m"
+    if "helsinki-nlp/opus-mt" in m or "/opus-mt-" in m:
+        return src_ui, tgt_ui, "marian"
     return map_nllb(src_ui), map_nllb(tgt_ui), "nllb"
 
-def gen_text(mid, mdl, tok, text, src_ui, tgt_ui, max_new=64, beams=4, num_return_sequences=1):
+def bos_id(tok, tgt_code):
+    if hasattr(tok, "lang_code_to_id") and tgt_code in tok.lang_code_to_id:
+        return tok.lang_code_to_id[tgt_code]
+    if hasattr(tok, "get_lang_id"):
+        try:
+            return tok.get_lang_id(tgt_code)
+        except Exception:
+            pass
+    for cand in (tgt_code, f"__{tgt_code}__", f"<<{tgt_code}>>"):
+        try:
+            tid = tok.convert_tokens_to_ids(cand)
+        except Exception:
+            tid = None
+        if isinstance(tid, int) and tid > 0:
+            return tid
+    return None
+
+def gen_text(mid, mdl, tok, text, src_ui, tgt_ui, max_new=64, beams=6, num_return_sequences=1):
     src_code, tgt_code, kind = model_langs(mid, src_ui, tgt_ui)
     if hasattr(tok, "src_lang"):
         tok.src_lang = src_code
     enc = tok([text], return_tensors="pt", padding=True, truncation=True, max_length=128)
     enc = {k: v.to(DEVICE) for k, v in enc.items()}
+    bos = None
     if kind == "m2m" and hasattr(tok, "get_lang_id"):
-        bos = tok.get_lang_id(tgt_code)
-    else:
-        bos = tok.convert_tokens_to_ids(tgt_code)
+        bos = tok.get_lang_id(map_m2m(tgt_ui))
+    elif kind == "nllb":
+        bos = tok.convert_tokens_to_ids(map_nllb(tgt_ui))
     with torch.no_grad():
-        gen = mdl.generate(
+        kwargs = dict(
             **enc,
-            forced_bos_token_id=bos,
             max_new_tokens=max_new,
+            min_new_tokens=1,
             num_beams=beams,
             num_return_sequences=num_return_sequences,
             do_sample=False,
             length_penalty=1.0,
+            no_repeat_ngram_size=2,
             num_beam_groups=4 if num_return_sequences > 1 else 1,
             diversity_penalty=0.2 if num_return_sequences > 1 else 0.0,
             logits_processor=get_logits_processors(tok),
+            early_stopping=True,
         )
+        if bos is not None:
+            kwargs["forced_bos_token_id"] = bos
+        gen = mdl.generate(**kwargs)
     outs = tok.batch_decode(gen, skip_special_tokens=True)
     return outs if num_return_sequences > 1 else outs[0]
 
-def translate_one(text, src_code, tgt_code, max_new=64, beams=4):
+
+def translate_one(text, src_code, tgt_code, max_new=12, beams=8):
     mid, mdl, tok = get_models()[0]
     return gen_text(mid, mdl, tok, text, src_code, tgt_code, max_new=max_new, beams=beams)
 
-def translate_k(text, src_code, tgt_code, k=12):
+def translate_k(text, src_code, tgt_code, k=16, max_new=10):
     outs = []
     for mid, mdl, tok in get_models():
-        outs.extend(gen_text(mid, mdl, tok, text, src_code, tgt_code, max_new=16, beams=max(8, k), num_return_sequences=min(k, max(8, k))))
+        outs.extend(gen_text(mid, mdl, tok, text, src_code, tgt_code, max_new=max_new, beams=max(8, k), num_return_sequences=min(k, max(8, k))))
     seen, uniq = set(), []
     for o in outs:
         o2 = o.strip()
@@ -190,6 +325,7 @@ def translate_k(text, src_code, tgt_code, k=12):
             seen.add(o2)
             uniq.append(o2)
     return uniq
+
 
 def one_word(s):
     core = re.sub(r"^[\W_]+|[\W_]+$", "", s.strip())
@@ -518,7 +654,7 @@ def cand_penalty(c, src):
     if " of " in c.lower():
         p -= 1.0
     if len(c.split()) > 3:
-        p -= 0.25
+        p -= 0.6
     if re.search(r"\d", c):
         p -= 0.1
     if re.match(r"^[A-Z][a-z]+$", c):
@@ -529,6 +665,10 @@ def cand_penalty(c, src):
         p -= 3.0
     if contains_untranslated_upper_token(src, c):
         p -= 1.0
+    if re.search(r"(?i)\b(also known as|known as|also called|called|is available|also available|was born|were born|sometimes called|commonly known as)\b", c):
+        p -= 2.2
+    if fold_ascii(c) == fold_ascii(src) and not is_caps_phrase(src) and not is_code_token(src):
+        p -= 1.8
     return p
 
 def nb_last_seg(s):
@@ -663,6 +803,16 @@ def is_code_token(tok):
         return False
     return fold_ascii(tok) == tok.lower()
 
+def enforce_single_term(src, cand):
+    if is_caps_phrase(src):
+        base = re.sub(r"\W+", "", cand)
+        if base != src:
+            return src
+    words = re.findall(r"[A-Za-z\-]+", cand)
+    words = words[:3]
+    out = " ".join(words).strip()
+    return out or cand.strip()
+
 def en_tweaks(x):
     x = re.sub(r"\b([Ss]ilver)\s+plated\b", r"\1-plated", x)
     x = re.sub(r"\bheat cable\b", "heating cable", x)
@@ -675,6 +825,12 @@ def en_tweaks(x):
 def post_norm(out, src):
     x = out
     x = re.sub(r"\([^)]*\)", "", x)
+    x = re.sub(r"(?i)^(?:this is|it is|that is)\s+", "", x)
+    x = re.sub(r"(?i)\b(?:also\s+)?known as\b\s*", "", x)
+    x = re.sub(r"(?i)\b(?:also\s+)?called\b\s*", "", x)
+    x = re.sub(r"(?i)\b(?:is|are)\s+(?:also\s+)?available\b\.?$", "", x).strip()
+    x = re.sub(r"(?i)\b(?:also\s+)?available\b\.?$", "", x).strip()
+    x = re.sub(r"(?i)\b(?:was|were)\s+born\b\.?", "", x)
     x = re.sub(r"(?i)\b(\d{1,6})\s*grader\b", r"\1°", x)
     x = re.sub(r"(?i)\b(\d{1,6})\s*gr\b", r"\1°", x)
     x = re.sub(r"(?i)\b(\d{1,6})\s*mm\b", r"\1mm", x)
@@ -770,7 +926,7 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
     if " " in s.strip():
         return translate_phrase(s, src_code, tgt_code, dict_first)
     if not one_word(s):
-        return post_norm(translate_one(s, src_code, tgt_code), s)
+        return post_norm(translate_one(s, src_code, tgt_code, max_new=12), s)
     if len(s.strip()) <= 3 and not re.search(r"[A-Za-zÆØÅæøå]", s):
         return s
     dict_cand = None
@@ -800,7 +956,7 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
             cands.extend(compound_candidate(comp, src_code, tgt_code))
         except Exception:
             pass
-    mt = translate_k(s, src_code, tgt_code, k=12) or [translate_one(s, src_code, tgt_code)]
+    mt = translate_k(s, src_code, tgt_code, k=16, max_new=10) or [translate_one(s, src_code, tgt_code, max_new=10)]
     for c in mt:
         if one_word(s):
             c = strip_leading_article(c)
@@ -809,7 +965,7 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
     best_sc = -1e9
     for c in dict.fromkeys([post_norm(x, s) for x in cands if x]):
         try:
-            back = translate_one(c, tgt_code, src_code, max_new=8, beams=4)
+            back = translate_one(c, tgt_code, src_code, max_new=10, beams=6)
         except Exception:
             back = ""
         sc = rt_score(s, back) + cand_penalty(c, s) + head_mismatch_penalty(s, back)
@@ -818,54 +974,13 @@ def smart_translate(s, src_code, tgt_code, dict_first=True):
         if sc > best_sc:
             best_sc = sc
             best = c
-    return post_norm(best if best is not None else cands[0], s)
+    final = best if best is not None else cands[0]
+    if one_word(s):
+        final = enforce_single_term(s, final)
+    return post_norm(final, s)
 
-def preload():
-    global _ready, _downloading
-    if _ready:
-        return
-    _downloading = True
-    try:
-        translate_one("hei", "nob_Latn", "eng_Latn")
-        _ready = True
-    finally:
-        _downloading = False
 
-@app.on_event("startup")
-def on_start():
-    threading.Thread(target=preload, daemon=True).start()
-
-@app.get("/status")
-def status():
-    ds = os.path.getsize(DICT_IDX) if os.path.exists(DICT_IDX) else 0
-    mids = get_model_ids()
-    return {"ready": _ready, "downloading": _downloading, "models": mids, "dict_index_bytes": ds}
-
-@app.post("/clear_cache")
-def clear_cache():
-    try:
-        if os.path.exists(_cache_path):
-            os.remove(_cache_path)
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/dict_test")
-def dict_test(term: str):
-    try:
-        ensure_nb_dict()
-        d = dict_lookup(term)
-        src = norm_lang("nb")
-        tgt = norm_lang("en")
-        mt = translate_one(term, src, tgt)
-        comp, exact = split_compound(term)
-        fuzz = dict_fuzzy(term) if not d else None
-        return {"term": term, "dict": d, "compound": comp, "compound_exact": exact, "fuzzy": fuzz, "mt": mt}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/", response_class=HTMLResponse)
-def index():
+def index_html():
     return """
 <!doctype html>
 <html>
@@ -893,6 +1008,7 @@ hr{border:0;border-top:1px solid #1d232b;margin:16px 0}
 .progress{height:10px;background:#0b0f13;border:1px solid #27303b;border-radius:999px;overflow:hidden}
 .bar{height:100%;width:0%}
 footer{opacity:.7;font-size:12px;margin-top:12px}
+.help{font-size:12px;opacity:.85}
 </style>
 </head>
 <body>
@@ -942,6 +1058,7 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
         <div class="progress" style="flex:1"><div class="bar" :style="{width: progressPct+'%', background: downloading? '#444' : '#2f6feb'}"></div></div>
         <div class="badge">{{stage}} {{done}}/{{total}}</div>
       </div>
+      <div class="notice help" v-if="jobId">{{ explain }}</div>
       <div class="row">
         <button :disabled="!readyToTranslate || loading || jobId" @click="start">Translate</button>
         <div class="badge" v-if="status">{{status}}</div>
@@ -954,18 +1071,54 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
 <script src="https://unpkg.com/vue@3"></script>
 <script>
 const app = Vue.createApp({
-  data(){return{file:null,token:null,sheets:[],sheet:null,columns:[],srcCol:null,tgtCol:null,mode:"append_new",srcLang:"nb",tgtLang:"en",status:"",loading:false,downloading:false,timer:null,jobId:null,progressPct:0,done:0,total:0,stage:"",dictFirst:true,models:[]}},
+  data(){return{file:null,token:null,sheets:[],sheet:null,columns:[],srcCol:null,tgtCol:null,mode:"append_new",srcLang:"nb",tgtLang:"en",status:"",loading:false,downloading:false,timer:null,jobId:null,progressPct:0,done:0,total:0,stage:"",dictFirst:true,models:[],transStartTs:null,elapsedSec:0}},
   computed:{
     readyToTranslate(){return this.token&&this.sheet&&this.srcCol&&this.tgtCol},
-    notice(){const m=this.models&&this.models.length?this.models.join(", "):(this.model||"facebook/nllb-200-distilled-600M");return m+" + Wiktextract + DP splitter"}
+    notice(){const m=this.models&&this.models.length?this.models.join(", "):(this.model||"facebook/nllb-200-distilled-600M");return m+" + Wiktextract + DP splitter"},
+    explain(){
+      if(!this.jobId) return "";
+      if(this.stage==="loading") return "Reading workbook and scanning columns.";
+      if(this.stage==="downloading") return "Preparing dictionary index.";
+      if(this.stage==="translating"){
+        const q=this.total||0;const d=this.done||0;const r=q>0?Math.max(0,q-d):0;
+        const elapsed=this.elapsedSec;const rate=d>0?d/Math.max(1,elapsed):0;
+        const ipm=rate>0?(rate*60).toFixed(1):"";
+        const dur=this.formatTime(elapsed);
+        const mode=this.dictFirst?"dictionary first + MT":"machine translation only";
+        return "Translating "+q+" unique values from "+this.srcLang+" to "+this.tgtLang+" using "+mode+". "+d+" done, "+r+" remaining · elapsed "+dur+(ipm? " · ~"+ipm+" items/min":"");
+      }
+      if(this.stage==="writing") return "Writing results to sheet "+this.sheet+" in column "+this.tgtCol+".";
+      if(this.stage==="done") return "Finished. Your translated file is being downloaded.";
+      if(this.stage==="error") return "An error occurred. See status for details.";
+      return "";
+    }
   },
   methods:{
+    formatTime(s){const m=Math.floor(s/60);const sec=(s%60).toString().padStart(2,"0");return m+":"+sec},
     async refreshStatus(){try{const r=await fetch("/status");if(!r.ok)return;const j=await r.json();this.models=j.models||[];this.model=j.model||null}catch(e){}},
     onFile(e){this.file=e.target.files[0];this.token=null;this.sheets=[];this.columns=[];this.srcCol=null;this.tgtCol=null},
     async inspect(){if(!this.file)return;this.loading=true;this.status="Inspecting";const fd=new FormData();fd.append("file",this.file);const r=await fetch("/inspect",{method:"POST",body:fd});if(!r.ok){this.status="Failed to read file";this.loading=false;return}const j=await r.json();this.token=j.token;this.sheets=j.sheets;this.sheet=j.sheets[0]||null;this.columns=j.columns||[];this.srcCol=this.columns[0]||null;this.tgtCol=this.srcCol?this.srcCol+"_en":null;this.status="Ready";this.loading=false},
     async fetchColumns(){if(!this.token||!this.sheet)return;this.loading=true;this.status="Loading columns";const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);const r=await fetch("/columns",{method:"POST",body:fd});if(!r.ok){this.status="Failed to load columns";this.loading=false;return}const j=await r.json();this.columns=j.columns||[];if(!this.srcCol)this.srcCol=this.columns[0]||null;this.status="Ready";this.loading=false},
-    async start(){this.status="Starting";const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);fd.append("src_col",this.srcCol);fd.append("tgt_col",this.tgtCol);fd.append("src_lang",this.srcLang);fd.append("tgt_lang",this.tgtLang);fd.append("mode",this.mode);fd.append("dict_first",this.dictFirst?"true":"false");const r=await fetch("/start",{method:"POST",body:fd});if(!r.ok){this.status="Failed to start";return}const j=await r.json();this.jobId=j.job;this.status="Translating";this.poll()},
-    async poll(){if(!this.jobId)return;const r=await fetch(`/job?job=${this.jobId}`);if(!r.ok){this.status="Job error";return}const j=await r.json();this.stage=j.stage;this.done=j.done;this.total=j.total;this.downloading=j.stage==="downloading";this.progressPct=j.total?Math.min(100,Math.round(100*j.done/j.total)):(j.stage==="done"?100:0);if(j.stage==="done"){const d=await fetch(`/download?job=${this.jobId}`);const blob=await d.blob();const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="translated.xlsx";document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);this.status="Downloaded";this.jobId=null;return}if(j.stage==="error"){this.status=j.error||"Error";this.jobId=null;return}setTimeout(this.poll,500)}
+    async start(){this.status="Starting";this.transStartTs=null;this.elapsedSec=0;const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);fd.append("src_col",this.srcCol);fd.append("tgt_col",this.tgtCol);fd.append("src_lang",this.srcLang);fd.append("tgt_lang",this.tgtLang);fd.append("mode",this.mode);fd.append("dict_first",this.dictFirst?"true":"false");const r=await fetch("/start",{method:"POST",body:fd});if(!r.ok){this.status="Failed to start";return}const j=await r.json();this.jobId=j.job;this.status="Translating";this.poll()},
+    async poll(){
+      if(!this.jobId)return;
+      const r=await fetch(`/job?job=${this.jobId}`);
+      if(!r.ok){this.status="Job error";return}
+      const j=await r.json();
+      this.stage=j.stage;this.done=j.done;this.total=j.total;this.downloading=j.stage==="downloading";
+      this.progressPct=j.total?Math.min(100,Math.round(100*j.done/j.total)):(j.stage==="done"?100:0);
+      if(this.stage==="translating"){if(!this.transStartTs)this.transStartTs=Date.now();this.elapsedSec=Math.floor((Date.now()-this.transStartTs)/1000)}
+      else{this.transStartTs=null;this.elapsedSec=0}
+      if(j.stage==="done"){
+        const d=await fetch(`/download?job=${this.jobId}`);
+        const blob=await d.blob();
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement("a");a.href=url;a.download="translated.xlsx";document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+        this.status="Downloaded";this.jobId=null;return
+      }
+      if(j.stage==="error"){this.status=j.error||"Error";this.jobId=null;return}
+      setTimeout(this.poll,500)
+    }
   },
   mounted(){this.refreshStatus()}
 })
@@ -983,6 +1136,53 @@ fetch("/status").then(r=>r.json()).then(j=>{
 </html>
 """
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _ready, _downloading
+    _ready = True
+    _downloading = False
+    def _warm_models():
+        try:
+            translate_one("hei", "nob_Latn", "eng_Latn", max_new=4, beams=2)
+        except Exception:
+            pass
+    threading.Thread(target=_warm_models, daemon=True).start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/status")
+def status():
+    ds = os.path.getsize(DICT_IDX) if os.path.exists(DICT_IDX) else 0
+    mids = get_model_ids()
+    return {"ready": _ready, "downloading": _downloading, "models": mids, "dict_index_bytes": ds}
+
+@app.post("/clear_cache")
+def clear_cache():
+    try:
+        if os.path.exists(_cache_path):
+            os.remove(_cache_path)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/dict_test")
+def dict_test(term: str):
+    try:
+        ensure_nb_dict()
+        d = dict_lookup(term)
+        src = norm_lang("nb")
+        tgt = norm_lang("en")
+        mt = translate_one(term, src, tgt)
+        comp, exact = split_compound(term)
+        fuzz = dict_fuzzy(term) if not d else None
+        return {"term": term, "dict": d, "compound": comp, "compound_exact": exact, "fuzzy": fuzz, "mt": mt}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return index_html()
 
 @app.post("/inspect")
 async def inspect(file: UploadFile):
@@ -1056,12 +1256,9 @@ def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, dict_
             _jobs[job]["stage"] = "translating"
             src_code = norm_lang(src_lang)
             tgt_code = norm_lang(tgt_lang)
+            outs = translate_many(uniq, src_code, tgt_code, dict_first)
             for i, s in enumerate(uniq, 1):
-                try:
-                    out = smart_translate(s, src_code, tgt_code, dict_first)
-                    cache[s] = out
-                except Exception:
-                    cache[s] = ""
+                cache[s] = outs[i-1]
                 _jobs[job]["done"] = i
             save_cache(cache)
         _jobs[job]["stage"] = "writing"
@@ -1078,6 +1275,7 @@ def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, dict_
         bio.seek(0)
         _jobs[job]["result"] = bio.read()
         _jobs[job]["stage"] = "done"
+        clear_cache_file()
     except Exception as e:
         _jobs[job]["stage"] = "error"
         _jobs[job]["error"] = str(e)
