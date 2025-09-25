@@ -34,6 +34,8 @@ pip install --upgrade pip
 pip install fastapi "uvicorn[standard]" pandas openpyxl transformers sentencepiece requests
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install python-multipart
+python -m pip install -U sentencepiece sacremoses
+$env:MT_MODEL_IDS = "Helsinki-NLP/opus-mt-tc-big-gmq-en,facebook/nllb-200-1.3B,facebook/m2m100_1.2B"
 python -m uvicorn app:app --reload
 
 Open http://127.0.0.1:8000
