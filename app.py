@@ -1,209 +1,56 @@
-import io, uuid, os, json, re, unicodedata as ud, difflib, pandas as pd, torch, threading, requests
-from fastapi import FastAPI, UploadFile, Form, Query
+import io, uuid, os, json, re, pandas as pd, torch, threading
+from fastapi import FastAPI, UploadFile, Form, Query, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from contextlib import asynccontextmanager
 
 _files = {}
-_models = {}
 _jobs = {}
+_models = {}
+_glossaries = {}
 _ready = False
-_downloading = False
-_cache_path = os.environ.get("MT_CACHE_PATH", ".translate_cache.json")
+
+CACHE_PATH = os.environ.get("MT_CACHE_PATH", ".translate_cache.json")
 MODEL_ROOT = os.environ.get("MODEL_ROOT", "models")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-DICT_DIR = os.environ.get("DICT_DIR", "dict")
-DICT_JSONL = os.path.join(DICT_DIR, "nb.jsonl")
-DICT_IDX = os.path.join(DICT_DIR, "nb_idx.json")
-DICT_ASC_IDX = os.path.join(DICT_DIR, "nb_idx_ascii.json")
-DICT_ABBR_IDX = os.path.join(DICT_DIR, "nb_idx_abbr.json")
-DICT_EXT_IDX = os.path.join(DICT_DIR, "nb_idx_ext.json")
-DICT_EXT_ASC = os.path.join(DICT_DIR, "nb_idx_ext_ascii.json")
-EXT_DIR = os.path.join(DICT_DIR, "ext")
-DICT_URL = "https://kaikki.org/dictionary/Norwegian%20Bokm%C3%A5l/kaikki.org-dictionary-NorwegianBokm%C3%A5l.jsonl"
-ART_RE = re.compile(r'^(?:an?|the)\s+', re.I)
-PARENS_RE = re.compile(r'\([^)]*\)')
-HEADS = {"skive","hjul","lampe","mal","senter","styring","sliper","skjerm","hylle","mutter","maskin","hus","boks","kabel","plugg","bolt","skrue","ror","ventil","kontakt","sensor","pumpe","motor","plate","holder","verktoy","ledning","panel"}
-BAD_FINAL = {"smal","stor","liten","god","ny","fri"}
 FAST_BATCH = int(os.environ.get("MT_BATCH", "128"))
+MASK_CODES = os.environ.get("MASK_CODES", "1") == "1"
+CACHE_VER = "v3"
 
-_dict_idx = None
-_dict_idx_ascii = None
-_abbr_idx = None
-_ext_idx = None
-_ext_idx_ascii = None
+PLACE_OPEN = "｟"
+PLACE_CLOSE = "｠"
 
-def fold(s):
-    return ud.normalize("NFKC", s).strip()
-
-def fold_key(s):
-    return ud.normalize("NFKC", s).strip().casefold()
-
-def fold_ascii(s):
-    d = ud.normalize("NFKD", s)
-    return "".join(c for c in d if not ud.combining(c)).casefold().strip()
+_special_tok_ready = {}
+CODE2_RE = re.compile(r"(?<!\w)(?:[A-Za-zÆØÅæøå]+[A-Za-z0-9ÆØÅæøå\-/\.]*\d[A-Za-z0-9ÆØÅæøå\-/\.]*|\d[A-Za-zÆØÅæøå][A-Za-z0-9ÆØÅæøå\-/\.]*)(?!\w)")
+RESTORE_RE = re.compile(r"｟\s*c\s*(\d+)\s*｠", re.I)
 
 def load_cache():
-    if os.path.exists(_cache_path):
-        with open(_cache_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+    if os.path.exists(CACHE_PATH):
+        try:
+            return json.load(open(CACHE_PATH, "r", encoding="utf-8"))
+        except Exception:
+            return {}
     return {}
 
 def save_cache(c):
-    with open(_cache_path, "w", encoding="utf-8") as f:
-        json.dump(c, f, ensure_ascii=False)
-
-def clear_cache_file():
     try:
-        if os.path.exists(_cache_path):
-            os.remove(_cache_path)
+        json.dump(c, open(CACHE_PATH, "w", encoding="utf-8"), ensure_ascii=False)
     except Exception:
         pass
 
 def model_path(mid):
-    local = os.path.join(MODEL_ROOT, *mid.split("/"))
-    return local if os.path.isdir(local) else mid
-
-_ban_cache = {}
-
-class BanAtStart(LogitsProcessor):
-    def __init__(self, ids):
-        self.ids = set(i for i in ids if i is not None)
-    def __call__(self, input_ids, scores):
-        if input_ids.shape[1] == 1 and self.ids:
-            scores[:, list(self.ids)] = -1e9
-        return scores
-
-class BanAlways(LogitsProcessor):
-    def __init__(self, ids):
-        self.ids = set(i for i in ids if i is not None)
-    def __call__(self, input_ids, scores):
-        if self.ids:
-            scores[:, list(self.ids)] = -1e9
-        return scores
-
-def build_bans(tok):
-    start = []
-    for s in [" a", " an", " the", " is", " was", " are", " were", " also", " called", " known"]:
-        ids = tok.encode(s, add_special_tokens=False)
-        if len(ids) == 1:
-            start.append(ids[0])
-    anyt = []
-    for s in ["(", " (", ")", " )", " also known", " sometimes", " commonly", " called", " available", " born", " was", " were"]:
-        ids = tok.encode(s, add_special_tokens=False)
-        anyt.extend(ids)
-    return list(dict.fromkeys(start)), list(dict.fromkeys(anyt))
-
-
-def get_logits_processors(tok):
-    k = id(tok)
-    if k not in _ban_cache:
-        s, a = build_bans(tok)
-        _ban_cache[k] = LogitsProcessorList([BanAtStart(s), BanAlways(a)])
-    return _ban_cache[k]
-
-def norm_lang(x):
-    x = (x or "").lower().strip()
-    if x in ("nb", "no"):
-        return "nob_Latn"
-    if x == "nn":
-        return "nno_Latn"
-    return "eng_Latn"
-
-def default_model():
-    return "facebook/nllb-200-1.3B" if DEVICE == "cuda" else "facebook/nllb-200-distilled-600M"
+    p = os.path.join(MODEL_ROOT, *mid.split("/"))
+    return p if os.path.isdir(p) else mid
 
 def get_model_ids():
     v = os.environ.get("MT_MODEL_IDS", "").strip()
     if v:
         return [x.strip() for x in v.split(",") if x.strip()]
     return [
-        "Helsinki-NLP/opus-mt-tc-big-gmq-en",
-        ("facebook/nllb-200-1.3B" if DEVICE == "cuda" else "facebook/nllb-200-distilled-600M"),
+        "facebook/nllb-200-1.3B" if DEVICE == "cuda" else "facebook/nllb-200-distilled-600M",
         "facebook/m2m100_1.2B",
+        "Helsinki-NLP/opus-mt-tc-big-gmq-en"
     ]
-
-def batch_gen(mid, mdl, tok, texts, src_ui, tgt_ui, max_new=10, beams=6):
-    src_code, tgt_code, kind = model_langs(mid, src_ui, tgt_ui)
-    if hasattr(tok, "src_lang"):
-        tok.src_lang = src_code
-    enc = tok(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-    enc = {k: v.to(DEVICE) for k, v in enc.items()}
-    bos = None
-    if kind == "m2m" and hasattr(tok, "get_lang_id"):
-        bos = tok.get_lang_id(map_m2m(tgt_ui))
-    elif kind == "nllb":
-        bos = tok.convert_tokens_to_ids(map_nllb(tgt_ui))
-    with torch.no_grad():
-        kwargs = dict(
-            **enc,
-            max_new_tokens=max_new,
-            min_new_tokens=1,
-            num_beams=beams,
-            do_sample=False,
-            length_penalty=1.0,
-            no_repeat_ngram_size=2,
-            logits_processor=get_logits_processors(tok),
-            early_stopping=True,
-        )
-        if bos is not None:
-            kwargs["forced_bos_token_id"] = bos
-        out_ids = mdl.generate(**kwargs)
-    outs = tok.batch_decode(out_ids, skip_special_tokens=True)
-    return [post_norm(o, t) for o, t in zip(outs, texts)]
-
-def translate_many(texts, src_code, tgt_code, dict_first=True, batch_size=FAST_BATCH):
-    primary = get_models()[0]
-    mid, mdl, tok = primary
-    results = [None] * len(texts)
-    mt_queue = []
-    mt_idx = []
-    for i, s in enumerate(texts):
-        z = s.strip()
-        if z == "":
-            results[i] = ""
-            continue
-        if is_code_token(z):
-            results[i] = z
-            continue
-        if z.isupper() and 2 <= len(z) <= 6:
-            a = translate_upper_acronym(z, src_code, tgt_code)
-            results[i] = a if a else z
-            continue
-        if " " in z:
-            mt_queue.append(z)
-            mt_idx.append(i)
-            continue
-        if dict_first:
-            d = dict_lookup(z)
-            if not d:
-                comp, exact = split_compound(z)
-                if comp:
-                    try:
-                        d = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
-                        if "" in d:
-                            d = None
-                    except Exception:
-                        d = None
-            if not d:
-                d = dict_fuzzy(z)
-            if d:
-                results[i] = strip_leading_article(d)
-                continue
-        mt_queue.append(z)
-        mt_idx.append(i)
-    for j in range(0, len(mt_queue), batch_size):
-        chunk = mt_queue[j:j+batch_size]
-        outs = batch_gen(mid, mdl, tok, chunk, src_code, tgt_code, max_new=10, beams=6)
-        for k, out in enumerate(outs):
-            idx = mt_idx[j+k]
-            if one_word(texts[idx]):
-                out = enforce_single_term(texts[idx], out)
-            results[idx] = out
-    return results
-
-
 
 def load_model(mid):
     path = model_path(mid)
@@ -217,768 +64,160 @@ def load_model(mid):
     mdl = mdl.to(DEVICE)
     return mdl, tok
 
-def get_models():
-    ids = get_model_ids()
-    out = []
-    for mid in ids:
-        if mid not in _models:
-            try:
-                _models[mid] = load_model(mid)
-            except Exception:
-                _models[mid] = None
-        if _models[mid] is not None:
-            out.append((mid, *_models[mid]))
-    if not out:
-        raise RuntimeError("No models available")
-    return out
+def get_model(mid=None):
+    mids = get_model_ids()
+    pick = mid or mids[0]
+    if pick not in _models:
+        _models[pick] = load_model(pick)
+    return pick, *_models[pick]
+
+def pick_model_for_target(model_id, tgt_ui):
+    if model_id:
+        return get_model(model_id)
+    mids = get_model_ids()
+    for m in mids:
+        if "helsinki-nlp/opus-mt" not in m.lower():
+            return get_model(m)
+    return get_model(mids[0])
+
+def ensure_special_tokens(tok, mdl):
+    k = id(tok)
+    if _special_tok_ready.get(k):
+        return
+    _special_tok_ready[k] = True
+
+def protect_codes(s: str):
+    repl = {}
+    i = [0]
+    def sub(m):
+        k = f"{PLACE_OPEN}c{i[0]}{PLACE_CLOSE}"
+        repl[k] = m.group(0)
+        i[0] += 1
+        return k
+    return CODE2_RE.sub(sub, s), repl
+
+def restore_codes(s: str, repl: dict):
+    def sub(m):
+        k = f"{PLACE_OPEN}c{m.group(1)}{PLACE_CLOSE}"
+        return repl.get(k, m.group(0))
+    return RESTORE_RE.sub(sub, s)
 
 def map_m2m(x):
     x = (x or "").lower().strip()
-    if x.startswith("en"):
-        return "en"
-    if x in ("nb","nob","nob_latn","bokmål","bokmaal","no","nor","norwegian"):
-        return "no"
-    if x in ("nn","nno","nno_latn"):
-        return "no"
+    if "_" in x or "-" in x and len(x) > 2:
+        return x
+    if x.startswith("en"): return "en"
+    if x in {"nb","nob","no","norwegian","bokmål","bokmaal"}: return "no"
+    if x in {"nn","nno"}: return "no"
     return x[:2] if len(x) >= 2 else x
 
 def map_nllb(x):
-    x = (x or "").lower().strip()
-    if x.startswith("en"):
-        return "eng_Latn"
-    if x in ("nb","no","nob","norwegian","bokmål","bokmaal"):
-        return "nob_Latn"
-    if x in ("nn","nno"):
-        return "nno_Latn"
-    return x
+    x = (x or "").strip()
+    if "_" in x: return x
+    y = x.lower()
+    if y.startswith("en"): return "eng_Latn"
+    if y in {"nb","nob","no","norwegian","bokmål","bokmaal"}: return "nob_Latn"
+    if y in {"nn","nno"}: return "nno_Latn"
+    if y in {"fi","fin","finnish"}: return "fin_Latn"
+    if y in {"sv","swe","swedish"}: return "swe_Latn"
+    if y in {"da","dan","danish"}: return "dan_Latn"
+    if y in {"de","deu","ger","german"}: return "deu_Latn"
+    if y in {"fr","fra","fre","french"}: return "fra_Latn"
+    if y in {"nl","nld","dut","dutch"}: return "nld_Latn"
+    if y in {"es","spa","spanish"}: return "spa_Latn"
+    if y in {"it","ita","italian"}: return "ita_Latn"
+    if y in {"pl","pol","polish"}: return "pol_Latn"
+    if y in {"et","est","estonian"}: return "est_Latn"
+    if y in {"lt","lit","lithuanian"}: return "lit_Latn"
+    if y in {"lv","lvs","lav","latvian"}: return "lvs_Latn"
+    if y in {"cs","ces","czech"}: return "ces_Latn"
+    if y in {"sk","slk","slovak"}: return "slk_Latn"
+    if y in {"ro","ron","rum","romanian"}: return "ron_Latn"
+    if y in {"ru","rus","russian"}: return "rus_Cyrl"
+    if y in {"uk","ukr","ukrainian"}: return "ukr_Cyrl"
+    if y in {"zh","zho","chi","cn"}: return "zho_Hans"
+    if y in {"ja","jpn","japanese"}: return "jpn_Jpan"
+    if y in {"ko","kor","korean"}: return "kor_Hang"
+    if y in {"tr","tur","turkish"}: return "tur_Latn"
+    return "eng_Latn"
 
 def model_langs(mid, src_ui, tgt_ui):
-    m = mid.lower()
+    m = (mid or "").lower()
     if "m2m100" in m:
         return map_m2m(src_ui), map_m2m(tgt_ui), "m2m"
     if "helsinki-nlp/opus-mt" in m or "/opus-mt-" in m:
         return src_ui, tgt_ui, "marian"
     return map_nllb(src_ui), map_nllb(tgt_ui), "nllb"
 
-def bos_id(tok, tgt_code):
-    if hasattr(tok, "lang_code_to_id") and tgt_code in tok.lang_code_to_id:
-        return tok.lang_code_to_id[tgt_code]
-    if hasattr(tok, "get_lang_id"):
-        try:
-            return tok.get_lang_id(tgt_code)
-        except Exception:
-            pass
-    for cand in (tgt_code, f"__{tgt_code}__", f"<<{tgt_code}>>"):
-        try:
-            tid = tok.convert_tokens_to_ids(cand)
-        except Exception:
-            tid = None
-        if isinstance(tid, int) and tid > 0:
-            return tid
-    return None
-
-def gen_text(mid, mdl, tok, text, src_ui, tgt_ui, max_new=64, beams=6, num_return_sequences=1):
+def batch_gen(mid, mdl, tok, texts, src_ui, tgt_ui, max_new=64, beams=4, temperature=0.0, top_p=1.0):
     src_code, tgt_code, kind = model_langs(mid, src_ui, tgt_ui)
+    if kind == "marian" and tgt_code not in ("en","eng_Latn"):
+        mid, mdl, tok = pick_model_for_target(None, tgt_ui)
+        src_code, tgt_code, kind = model_langs(mid, src_ui, tgt_ui)
     if hasattr(tok, "src_lang"):
         tok.src_lang = src_code
-    enc = tok([text], return_tensors="pt", padding=True, truncation=True, max_length=128)
+    ensure_special_tokens(tok, mdl)
+    pre, maps = [], []
+    for t in texts:
+        s = str(t or "").strip()
+        if MASK_CODES:
+            a, repl = protect_codes(s)
+        else:
+            a, repl = s, {}
+        pre.append(a)
+        maps.append(repl)
+    enc = tok(pre, return_tensors="pt", padding=True, truncation=True, max_length=256)
     enc = {k: v.to(DEVICE) for k, v in enc.items()}
     bos = None
     if kind == "m2m" and hasattr(tok, "get_lang_id"):
         bos = tok.get_lang_id(map_m2m(tgt_ui))
     elif kind == "nllb":
-        bos = tok.convert_tokens_to_ids(map_nllb(tgt_ui))
+        try:
+            bos = tok.convert_tokens_to_ids(map_nllb(tgt_ui))
+        except Exception:
+            bos = None
+    gen_kwargs = dict(**enc, max_new_tokens=max_new, min_new_tokens=1, length_penalty=1.0, no_repeat_ngram_size=2, early_stopping=True)
+    if temperature and float(temperature) > 0:
+        gen_kwargs.update(dict(do_sample=True, temperature=float(temperature), top_p=float(top_p), num_beams=1))
+    else:
+        gen_kwargs.update(dict(do_sample=False, num_beams=max(1, int(beams))))
+    if bos is not None:
+        gen_kwargs["forced_bos_token_id"] = bos
     with torch.no_grad():
-        kwargs = dict(
-            **enc,
-            max_new_tokens=max_new,
-            min_new_tokens=1,
-            num_beams=beams,
-            num_return_sequences=num_return_sequences,
-            do_sample=False,
-            length_penalty=1.0,
-            no_repeat_ngram_size=2,
-            num_beam_groups=4 if num_return_sequences > 1 else 1,
-            diversity_penalty=0.2 if num_return_sequences > 1 else 0.0,
-            logits_processor=get_logits_processors(tok),
-            early_stopping=True,
-        )
-        if bos is not None:
-            kwargs["forced_bos_token_id"] = bos
-        gen = mdl.generate(**kwargs)
-    outs = tok.batch_decode(gen, skip_special_tokens=True)
-    return outs if num_return_sequences > 1 else outs[0]
+        out_ids = mdl.generate(**gen_kwargs)
+    outs = tok.batch_decode(out_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    post = []
+    for o, repl in zip(outs, maps):
+        x = o.replace("\u2581", " ")
+        x = re.sub(r"(?i)(?:[<\[\(｟]\s*)?c\s*([0-9]{1,3})(?:\s*[>\]\)｠])?", rf"{PLACE_OPEN}c\1{PLACE_CLOSE}", x)
+        x = re.sub(r"\s+", " ", x).strip()
+        x = restore_codes(x, repl)
+        post.append(x)
+    return post
 
+def translate_many(texts, src_lang, tgt_lang, batch_size=FAST_BATCH, model_id=None, max_new=64, beams=4, temperature=0.0, top_p=1.0):
+    mid, mdl, tok = pick_model_for_target(model_id, tgt_lang)
+    todo = list(texts)
+    out = [None] * len(todo)
+    for j in range(0, len(todo), batch_size):
+        chunk = todo[j:j+batch_size]
+        res = batch_gen(mid, mdl, tok, chunk, src_lang, tgt_lang, max_new=max_new, beams=beams, temperature=temperature, top_p=top_p)
+        for k, r in enumerate(res):
+            out[j+k] = r
+    return out
 
-def translate_one(text, src_code, tgt_code, max_new=12, beams=8):
-    mid, mdl, tok = get_models()[0]
-    return gen_text(mid, mdl, tok, text, src_code, tgt_code, max_new=max_new, beams=beams)
-
-def translate_k(text, src_code, tgt_code, k=16, max_new=10):
-    outs = []
-    for mid, mdl, tok in get_models():
-        outs.extend(gen_text(mid, mdl, tok, text, src_code, tgt_code, max_new=max_new, beams=max(8, k), num_return_sequences=min(k, max(8, k))))
-    seen, uniq = set(), []
-    for o in outs:
-        o2 = o.strip()
-        if o2 and o2 not in seen:
-            seen.add(o2)
-            uniq.append(o2)
-    return uniq
-
-
-def one_word(s):
-    core = re.sub(r"^[\W_]+|[\W_]+$", "", s.strip())
-    return core != "" and " " not in core
-
-def rt_score(src, back):
-    a = fold(src).casefold()
-    b = fold(back).casefold()
-    s1 = difflib.SequenceMatcher(None, a, b).ratio()
-    a2 = ud.normalize("NFKD", src)
-    a2 = "".join(c for c in a2 if not ud.combining(c)).casefold()
-    b2 = ud.normalize("NFKD", back)
-    b2 = "".join(c for c in b2 if not ud.combining(c)).casefold()
-    s2 = difflib.SequenceMatcher(None, a2, b2).ratio()
-    return max(s1, s2)
-
-def ensure_nb_dict():
-    os.makedirs(DICT_DIR, exist_ok=True)
-    if os.path.exists(DICT_IDX) and os.path.exists(DICT_ASC_IDX) and os.path.exists(DICT_ABBR_IDX):
-        pass
+def apply_glossary(text, pairs):
+    if not pairs:
+        out = text
     else:
-        if not os.path.exists(DICT_JSONL):
-            with requests.get(DICT_URL, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                with open(DICT_JSONL, "wb") as f:
-                    for chunk in r.iter_content(1 << 20):
-                        if chunk:
-                            f.write(chunk)
-        build_nb_index()
-    build_ext_indexes()
-
-def clean_gloss(g):
-    g = PARENS_RE.sub("", g or "")
-    g = g.replace(";", ",").split(",")[0]
-    g = ART_RE.sub("", g)
-    g = re.sub(r"\s+", " ", g).strip()
-    return g
-
-def acceptable_gloss(g):
-    if not g:
-        return False
-    wl = g.split()
-    if len(wl) > 3:
-        return False
-    if any(c.isdigit() for c in g):
-        return False
-    bad = {"party", "festival", "feast", "banquet"}
-    if g.lower() in bad:
-        return False
-    if "chemical element" in g.lower():
-        return False
-    return True
-
-def extract_best_translation(obj):
-    pos_order = ["noun", "adjective", "verb", "adverb", "pronoun", "numeral", "name"]
-    senses = obj.get("senses") or []
-    best = None
-    best_rank = (10, 999)
-    for s in senses:
-        p = (s.get("pos") or "").lower()
-        if p == "proper-noun":
-            continue
-        if s.get("form_of"):
-            continue
-        trs = s.get("translations") or []
-        for t in trs:
-            if (t.get("lang") or "").lower() != "english":
+        out = text
+        for src, tgt in pairs:
+            if not src or not tgt:
                 continue
-            tags = [x.lower() for x in (t.get("tags") or [])]
-            if any(x in {"name", "proper"} for x in tags):
-                continue
-            w = clean_gloss(t.get("word") or "")
-            if not acceptable_gloss(w):
-                continue
-            rank = pos_order.index(p) if p in pos_order else len(pos_order) + 1
-            key = (rank, len(w))
-            if key < best_rank:
-                best = w
-                best_rank = key
-        if best:
-            continue
-        gl = s.get("glosses") or []
-        if not gl:
-            continue
-        g = clean_gloss(gl[0])
-        if not acceptable_gloss(g):
-            continue
-        rank = pos_order.index(p) if p in pos_order else len(pos_order) + 1
-        key = (rank, len(g))
-        if key < best_rank:
-            best = g
-            best_rank = key
-    return best
-
-def mk_acronym_en(phrase):
-    ws = re.findall(r"[A-Za-z]+", phrase)
-    stop = {"of","and","the","for","to","in","on","at","by","with"}
-    ws = [w for w in ws if w.lower() not in stop]
-    if len(ws) < 2 or len(ws) > 6:
-        return None
-    return "".join(w[0].upper() for w in ws)
-
-def build_nb_index():
-    lemma = {}
-    aliases = {}
-    abbr = {}
-    with open(DICT_JSONL, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            w = obj.get("word")
-            if not w:
-                continue
-            k = fold_key(w)
-            senses = obj.get("senses") or []
-            g = extract_best_translation(obj)
-            if g:
-                prev = lemma.get(k)
-                if prev is None or len(g) < len(prev):
-                    lemma[k] = g
-            for s in senses:
-                fos = s.get("form_of") or []
-                for fo in fos:
-                    b = fo.get("word")
-                    if b:
-                        aliases.setdefault(k, set()).add(fold_key(b))
-                tags = {t.lower() for t in (s.get("tags") or [])}
-                p = (s.get("pos") or "").lower()
-                if p in {"initialism","acronym","abbreviation"} or any(t in {"initialism","acronym","abbreviation"} for t in tags):
-                    glosses = s.get("glosses") or []
-                    if glosses:
-                        ac = mk_acronym_en(clean_gloss(glosses[0]))
-                        if ac:
-                            abbr[k] = ac
-    idx = {}
-    for k, g in lemma.items():
-        idx[k] = g
-    for ak, bases in aliases.items():
-        if ak in idx:
-            continue
-        for bk in bases:
-            if bk in lemma:
-                idx[ak] = lemma[bk]
-                break
-    asc = {}
-    for k, g in idx.items():
-        a = fold_ascii(k)
-        if a and (a not in asc or len(g) < len(asc[a])):
-            asc[a] = g
-    os.makedirs(DICT_DIR, exist_ok=True)
-    with open(DICT_IDX, "w", encoding="utf-8") as f:
-        json.dump(idx, f, ensure_ascii=False)
-    with open(DICT_ASC_IDX, "w", encoding="utf-8") as f:
-        json.dump(asc, f, ensure_ascii=False)
-    with open(DICT_ABBR_IDX, "w", encoding="utf-8") as f:
-        json.dump(abbr, f, ensure_ascii=False)
-    global _dict_idx, _dict_idx_ascii, _abbr_idx
-    _dict_idx = idx
-    _dict_idx_ascii = asc
-    _abbr_idx = abbr
-
-def build_ext_indexes():
-    os.makedirs(EXT_DIR, exist_ok=True)
-    pairs = {}
-    for name in os.listdir(EXT_DIR):
-        p = os.path.join(EXT_DIR, name)
-        if not os.path.isfile(p):
-            continue
-        if not any(name.lower().endswith(x) for x in [".tsv",".csv",".txt"]):
-            continue
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                for line in f:
-                    if "\t" in line:
-                        a, b = line.rstrip("\n").split("\t", 1)
-                    elif "," in line:
-                        a, b = line.rstrip("\n").split(",", 1)
-                    else:
-                        continue
-                    a2 = fold_key(a)
-                    b2 = clean_gloss(b)
-                    if a2 and b2:
-                        prev = pairs.get(a2)
-                        if prev is None or len(b2) < len(prev):
-                            pairs[a2] = b2
-        except Exception:
-            continue
-    asc = {}
-    for k, v in pairs.items():
-        a = fold_ascii(k)
-        if a and (a not in asc or len(v) < len(asc[a])):
-            asc[a] = v
-    with open(DICT_EXT_IDX, "w", encoding="utf-8") as f:
-        json.dump(pairs, f, ensure_ascii=False)
-    with open(DICT_EXT_ASC, "w", encoding="utf-8") as f:
-        json.dump(asc, f, ensure_ascii=False)
-    global _ext_idx, _ext_idx_ascii
-    _ext_idx = pairs
-    _ext_idx_ascii = asc
-
-def dict_load():
-    global _dict_idx, _dict_idx_ascii, _abbr_idx, _ext_idx, _ext_idx_ascii
-    if _dict_idx is not None and _dict_idx_ascii is not None and _abbr_idx is not None and _ext_idx is not None and _ext_idx_ascii is not None:
-        return
-    if not (os.path.exists(DICT_IDX) and os.path.exists(DICT_ASC_IDX) and os.path.exists(DICT_ABBR_IDX)):
-        ensure_nb_dict()
-    _dict_idx = json.load(open(DICT_IDX, "r", encoding="utf-8")) if os.path.exists(DICT_IDX) else {}
-    _dict_idx_ascii = json.load(open(DICT_ASC_IDX, "r", encoding="utf-8")) if os.path.exists(DICT_ASC_IDX) else {}
-    _abbr_idx = json.load(open(DICT_ABBR_IDX, "r", encoding="utf-8")) if os.path.exists(DICT_ABBR_IDX) else {}
-    if os.path.exists(DICT_EXT_IDX):
-        _ext_idx = json.load(open(DICT_EXT_IDX, "r", encoding="utf-8"))
-    else:
-        _ext_idx = {}
-    if os.path.exists(DICT_EXT_ASC):
-        _ext_idx_ascii = json.load(open(DICT_EXT_ASC, "r", encoding="utf-8"))
-    else:
-        _ext_idx_ascii = {}
-
-def dict_lookup_base_ascii_key(k):
-    v = (_ext_idx or {}).get(k)
-    if not v:
-        v = (_dict_idx or {}).get(k)
-    if not v:
-        a = fold_ascii(k)
-        v = (_ext_idx_ascii or {}).get(a)
-        if not v:
-            v = (_dict_idx_ascii or {}).get(a)
-    return v
-
-def format_casing(src, v):
-    if src.isupper():
-        return v.upper()
-    if len(src) > 1 and src[0].isupper() and src[1:].islower():
-        return v[:1].upper() + v[1:]
-    return v
-
-def dict_lookup(s):
-    dict_load()
-    k = fold_key(s)
-    if s.isupper() and 2 <= len(s) <= 6:
-        v2 = (_abbr_idx or {}).get(k)
-        if v2:
-            return v2 if v2.isupper() else v2.upper()
-        return s
-    v = dict_lookup_base_ascii_key(k)
-    if not v:
-        return None
-    return format_casing(s, v)
-
-def is_safe_english_gloss(v):
-    if not v or any(c.isdigit() for c in v):
-        return False
-    toks = re.findall(r"[A-Za-z\-]+", v)
-    if not toks:
-        return False
-    if len(v.split()) > 3:
-        return False
-    return True
-
-def dict_fuzzy(s, cutoff=None):
-    dict_load()
-    key = fold_ascii(s)
-    c = 0.935 if cutoff is None else cutoff
-    if len(key) >= 8:
-        c = min(c, 0.90)
-    matches = difflib.get_close_matches(key, list((_dict_idx_ascii or {}).keys()), n=1, cutoff=c)
-    if not matches:
-        return None
-    cand = matches[0]
-    if key[0] != cand[0] or key[-1] != cand[-1]:
-        return None
-    if abs(len(cand) - len(key)) > 1:
-        return None
-    v = (_dict_idx_ascii or {}).get(cand)
-    if not v or not is_safe_english_gloss(v):
-        return None
-    return format_casing(s, v)
-
-def ascii_close(seg, cutoff):
-    m = difflib.get_close_matches(seg, list((_dict_idx_ascii or {}).keys()), n=1, cutoff=cutoff)
-    if not m:
-        return None
-    cand = m[0]
-    if len(seg) >= 5 and (seg[0] != cand[0] or seg[-1] != cand[-1]):
-        return None
-    if abs(len(cand) - len(seg)) > 2:
-        return None
-    return cand
-
-def seg_score(seg):
-    if seg in (_dict_idx or {}):
-        return 0.0, seg, True
-    if seg in (_dict_idx_ascii or {}):
-        return 0.0, seg, True
-    if seg.endswith("s") and (seg[:-1] in (_dict_idx or {}) or seg[:-1] in (_dict_idx_ascii or {})):
-        base = seg[:-1]
-        return 0.1, base, True
-    cm = ascii_close(seg, 0.9 if len(seg) >= 6 else 0.94)
-    if cm:
-        return 0.7, cm, False
-    if len(seg) <= 4:
-        return 1.5, seg, False
-    return 3.0, seg, False
-
-def strip_leading_article(w):
-    return ART_RE.sub("", w).strip()
-
-def upper_tokens(s):
-    return re.findall(r"\b[A-ZÆØÅ]{2,}\b", s)
-
-def contains_untranslated_upper_token(src, cand):
-    toks = set(upper_tokens(src))
-    if not toks:
-        return False
-    words = set(re.findall(r"\b[A-ZÆØÅ]{2,}\b", cand))
-    return bool(toks & words)
-
-def cand_penalty(c, src):
-    p = 0.0
-    if re.match(r"(?i)^\s*(?:a|an|the)\s+", c):
-        p -= 0.5
-    if "(" in c or ")" in c:
-        p -= 0.5
-    if " of " in c.lower():
-        p -= 1.0
-    if len(c.split()) > 3:
-        p -= 0.6
-    if re.search(r"\d", c):
-        p -= 0.1
-    if re.match(r"^[A-Z][a-z]+$", c):
-        p -= 0.2
-    if re.fullmatch(r"[A-Za-z]+(?: [A-Za-z\-]+){0,2}", c) and difflib.SequenceMatcher(None, fold_ascii(src), c.lower().replace(" ", "")).ratio() >= 0.8:
-        p -= 0.9
-    if re.search(r"(?i)\bto\b", c):
-        p -= 3.0
-    if contains_untranslated_upper_token(src, c):
-        p -= 1.0
-    if re.search(r"(?i)\b(also known as|known as|also called|called|is available|also available|was born|were born|sometimes called|commonly known as)\b", c):
-        p -= 2.2
-    if fold_ascii(c) == fold_ascii(src) and not is_caps_phrase(src) and not is_code_token(src):
-        p -= 1.8
-    return p
-
-def nb_last_seg(s):
-    y = fold_ascii(s)
-    n3, _ = split_compound_suffix(y)
-    if n3:
-        return n3[-1]
-    n1, _ = split_compound_dp(y)
-    if n1:
-        return n1[-1]
-    m = re.findall(r"[a-zæøå]+", y)
-    return m[-1] if m else y
-
-def nb_pluralish(seg):
-    return bool(re.search(r"(er|ene|ar|or)$", seg))
-
-def head_mismatch_penalty(src, back):
-    try:
-        hs = nb_last_seg(src)
-        hb = nb_last_seg(back)
-    except Exception:
-        return 0.0
-    if hs == hb:
-        return 0.0
-    if nb_pluralish(hb) and not nb_pluralish(hs) and hb.rstrip("er") == hs:
-        return -0.7
-    return -0.4
-
-def nounify_head(w, src_seg):
-    if w.startswith("to "):
-        v = w[3:]
-        if re.fullmatch(r"[a-z\-]+", v):
-            return {v, v + "er"}
-    if src_seg.endswith("er"):
-        if re.fullmatch(r"[a-z\-]+", w) and not w.endswith("er"):
-            return {w, w + "er"}
-    return {w}
-
-def compound_candidate(segs, src_code, tgt_code):
-    pieces = []
-    for i, seg in enumerate(segs):
-        base_en = (_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg)
-        if not base_en:
-            dtry = dict_lookup(seg)
-            if dtry:
-                base_en = dtry
-            else:
-                if seg.endswith("er") and len(seg) > 2:
-                    dtry2 = dict_lookup(seg[:-1])
-                    if dtry2:
-                        base_en = dtry2
-                if not base_en:
-                    base_en = strip_leading_article(translate_one(seg, src_code, tgt_code, max_new=8, beams=4))
-        if i == len(segs) - 1:
-            heads = nounify_head(base_en, seg)
-            return [" ".join(pieces + [h]) for h in heads]
-        pieces.append(base_en)
-    return [" ".join(pieces)]
-
-def split_compound_dp(y, max_seg=24):
-    n = len(y)
-    dp = [None] * (n + 1)
-    dp[0] = (0.0, [])
-    exact_mask = [None] * (n + 1)
-    exact_mask[0] = []
-    for i in range(n):
-        if dp[i] is None:
-            continue
-        limit = min(n, i + max_seg)
-        for j in range(i + 2, limit + 1):
-            seg = y[i:j]
-            if not seg.isalpha():
-                continue
-            cost, base, exact = seg_score(seg)
-            prev_cost, prev_segs = dp[i]
-            adj = 0.0
-            if j == n:
-                if base in HEADS:
-                    adj -= 0.35
-                if base in BAD_FINAL:
-                    adj += 0.6
-            cand_cost = prev_cost + cost + 0.05 + adj
-            cand_list = prev_segs + [base]
-            if dp[j] is None or cand_cost < dp[j][0]:
-                dp[j] = (cand_cost, cand_list)
-                exact_mask[j] = (exact_mask[i] or []) + [exact]
-    if dp[n] is None:
-        return None, False
-    cost, segs = dp[n]
-    exact = all(exact_mask[n]) if exact_mask[n] else False
-    if len(segs) < 2:
-        return None, False
-    return segs, exact
-
-def split_compound_suffix(y):
-    for h in sorted(HEADS, key=len, reverse=True):
-        if y.endswith(h) and len(y) > len(h) + 1:
-            return [y[: len(y) - len(h)], h], False
-    return None, False
-
-def split_compound(w):
-    dict_load()
-    x = fold_key(w)
-    y = fold_ascii(w)
-    n1, e1 = split_compound_dp(x)
-    n2, e2 = split_compound_dp(y)
-    if n1 and n2:
-        if e1 and not e2:
-            return n1, e1
-        if e2 and not e1:
-            return n2, e2
-        if len("".join(n1)) >= len("".join(n2)):
-            return n1, e1
-        return n2, e2
-    if n1:
-        return n1, e1
-    if n2:
-        return n2, e2
-    n3, e3 = split_compound_suffix(y)
-    if n3:
-        return n3, e3
-    return None, False
-
-def is_caps_phrase(s):
-    letters = [c for c in s if c.isalpha()]
-    return bool(letters) and all(c.isupper() for c in letters)
-
-def is_code_token(tok):
-    if not re.fullmatch(r"[A-Z0-9][A-Z0-9\-/\.]*", tok):
-        return False
-    if tok.isalpha():
-        return False
-    return fold_ascii(tok) == tok.lower()
-
-def enforce_single_term(src, cand):
-    if is_caps_phrase(src):
-        base = re.sub(r"\W+", "", cand)
-        if base != src:
-            return src
-    words = re.findall(r"[A-Za-z\-]+", cand)
-    words = words[:3]
-    out = " ".join(words).strip()
-    return out or cand.strip()
-
-def en_tweaks(x):
-    x = re.sub(r"\b([Ss]ilver)\s+plated\b", r"\1-plated", x)
-    x = re.sub(r"\bheat cable\b", "heating cable", x)
-    x = re.sub(r"\bventilation house\b", "ventilation housing", x)
-    x = re.sub(r"\bcapsling\b", "enclosure", x)
-    x = re.sub(r"\bcapsing\b", "enclosure", x)
-    x = re.sub(r"(?i)\bservo (management|steering)\b", "power steering", x)
-    return x
-
-def post_norm(out, src):
-    x = out
-    x = re.sub(r"\([^)]*\)", "", x)
-    x = re.sub(r"(?i)^(?:this is|it is|that is)\s+", "", x)
-    x = re.sub(r"(?i)\b(?:also\s+)?known as\b\s*", "", x)
-    x = re.sub(r"(?i)\b(?:also\s+)?called\b\s*", "", x)
-    x = re.sub(r"(?i)\b(?:is|are)\s+(?:also\s+)?available\b\.?$", "", x).strip()
-    x = re.sub(r"(?i)\b(?:also\s+)?available\b\.?$", "", x).strip()
-    x = re.sub(r"(?i)\b(?:was|were)\s+born\b\.?", "", x)
-    x = re.sub(r"(?i)\b(\d{1,6})\s*grader\b", r"\1°", x)
-    x = re.sub(r"(?i)\b(\d{1,6})\s*gr\b", r"\1°", x)
-    x = re.sub(r"(?i)\b(\d{1,6})\s*mm\b", r"\1mm", x)
-    x = re.sub(r"(?i)\bnr\.?\b", "No.", x)
-    x = re.sub(r"No\.\.", "No.", x)
-    x = re.sub(r"(\d),(\d)", r"\1.\2", x)
-    x = re.sub(r"\s+", " ", x).strip()
-    x = re.sub(r"(?i)\b(a|an|the)\s+(?=[a-z])", "", x)
-    x = en_tweaks(x)
-    if is_caps_phrase(src):
-        x = x.upper()
-    return x
-
-def translate_upper_acronym(tok, src_code, tgt_code):
-    if not (tok.isupper() and 2 <= len(tok) <= 6):
-        return None
-    hint = (_abbr_idx or {}).get(fold_key(tok))
-    if hint:
-        return hint if hint.isupper() else hint.upper()
-    return tok
-
-def translate_phrase(s, src_code, tgt_code, dict_first=True):
-    parts = re.split(r"(\W+)", s)
-    out = []
-    used_compound = False
-    for tok in parts:
-        if tok == "":
-            continue
-        if re.fullmatch(r"[^\W\d_]+", tok, re.UNICODE):
-            if is_code_token(tok):
-                out.append(tok)
-                continue
-            if tok.isupper() and len(tok) >= 2:
-                result = dict_lookup(tok)
-                out.append(result if result else tok)
-                continue
-            a = translate_upper_acronym(tok, src_code, tgt_code)
-            if a and a != tok:
-                out.append(a)
-                continue
-            t = None
-            if dict_first:
-                t = dict_lookup(tok)
-                if not t:
-                    comp, exact = split_compound(tok)
-                    if comp:
-                        pieces = []
-                        for seg in comp:
-                            base_en = (_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg)
-                            if not base_en:
-                                base_en = dict_lookup(seg)
-                            if not base_en and seg.endswith("er") and len(seg) > 2:
-                                base_en = dict_lookup(seg[:-1])
-                            if not base_en:
-                                try:
-                                    base_en = strip_leading_article(translate_one(seg, src_code, tgt_code, max_new=8, beams=4))
-                                except Exception:
-                                    base_en = seg
-                            pieces.append(base_en)
-                        t = " ".join(pieces)
-                        used_compound = True
-                if not t:
-                    tf = dict_fuzzy(tok)
-                    if tf:
-                        t = tf
-            if not t:
-                if one_word(tok):
-                    t = translate_one(tok, src_code, tgt_code)
-                else:
-                    t = tok
-            if one_word(tok):
-                t = strip_leading_article(t)
-            out.append(t)
-        else:
-            out.append(tok)
-    wordwise = post_norm("".join(out), s)
-    mt_all = post_norm(translate_one(s, src_code, tgt_code), s)
-    try:
-        back_word = translate_one(wordwise, tgt_code, src_code, max_new=16, beams=4)
-    except Exception:
-        back_word = ""
-    try:
-        back_mt = translate_one(mt_all, tgt_code, src_code, max_new=16, beams=4)
-    except Exception:
-        back_mt = ""
-    sc_word = rt_score(s, back_word) + cand_penalty(wordwise, s) + head_mismatch_penalty(s, back_word)
-    sc_mt = rt_score(s, back_mt) + cand_penalty(mt_all, s) + head_mismatch_penalty(s, back_mt)
-    if used_compound:
-        sc_word += 0.9
-    return wordwise if sc_word >= sc_mt else mt_all
-
-def smart_translate(s, src_code, tgt_code, dict_first=True):
-    if " " in s.strip():
-        return translate_phrase(s, src_code, tgt_code, dict_first)
-    if not one_word(s):
-        return post_norm(translate_one(s, src_code, tgt_code, max_new=12), s)
-    if len(s.strip()) <= 3 and not re.search(r"[A-Za-zÆØÅæøå]", s):
-        return s
-    dict_cand = None
-    comp = None
-    exact = False
-    if dict_first:
-        dict_cand = dict_lookup(s)
-        if not dict_cand:
-            comp, exact = split_compound(s)
-            if comp:
-                try:
-                    dict_cand = " ".join(((_dict_idx or {}).get(seg) or (_dict_idx_ascii or {}).get(seg) or "") for seg in comp)
-                    if "" in dict_cand:
-                        dict_cand = None
-                except Exception:
-                    dict_cand = None
-        if not dict_cand:
-            dict_cand = dict_fuzzy(s)
-    cands = []
-    ac = translate_upper_acronym(s, src_code, tgt_code)
-    if ac and ac != s:
-        cands.append(ac)
-    if dict_cand:
-        cands.append(strip_leading_article(dict_cand))
-    if comp:
-        try:
-            cands.extend(compound_candidate(comp, src_code, tgt_code))
-        except Exception:
-            pass
-    mt = translate_k(s, src_code, tgt_code, k=16, max_new=10) or [translate_one(s, src_code, tgt_code, max_new=10)]
-    for c in mt:
-        if one_word(s):
-            c = strip_leading_article(c)
-        cands.append(c)
-    best = None
-    best_sc = -1e9
-    for c in dict.fromkeys([post_norm(x, s) for x in cands if x]):
-        try:
-            back = translate_one(c, tgt_code, src_code, max_new=10, beams=6)
-        except Exception:
-            back = ""
-        sc = rt_score(s, back) + cand_penalty(c, s) + head_mismatch_penalty(s, back)
-        if dict_cand and c.lower() == strip_leading_article(dict_cand).lower():
-            sc += 1.2
-        if sc > best_sc:
-            best_sc = sc
-            best = c
-    final = best if best is not None else cands[0]
-    if one_word(s):
-        final = enforce_single_term(s, final)
-    return post_norm(final, s)
-
+            pat = re.compile(rf"(?i)(?<!\w){re.escape(src)}(?!\w)")
+            out = pat.sub(tgt, out)
+    out = re.sub(r"(?i)\b(\d+)\s*grades\b", r"\1 degrees", out)
+    return out
 
 def index_html():
     return """
@@ -991,14 +230,14 @@ def index_html():
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
 <style>
 body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b0d10;color:#e8eef5;margin:0}
-.container{max-width:900px;margin:40px auto;padding:24px;background:#12161b;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.container{max-width:980px;margin:40px auto;padding:24px;background:#12161b;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
 h1{font-size:24px;margin:0 0 16px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .row{display:flex;gap:12px;align-items:center;margin:12px 0}
 .card{background:#0f1317;border:1px solid #1d232b;border-radius:14px;padding:16px}
 label{font-size:13px;color:#a7b0bc}
-input[type=file],select,button,input[type=text]{width:100%}
-select,input[type=file],input[type=text]{background:#0b0f13;border:1px solid #27303b;color:#e8eef5;border-radius:12px;padding:10px;font-size:14px}
+input[type=file],select,button,input[type=text],input[type=number]{width:100%}
+select,input[type=file],input[type=text],input[type=number]{background:#0b0f13;border:1px solid #27303b;color:#e8eef5;border-radius:12px;padding:10px;font-size:14px}
 button{background:#2f6feb;border:0;color:#fff;border-radius:12px;padding:12px 14px;font-weight:600;cursor:pointer}
 button:disabled{opacity:.5;cursor:not-allowed}
 small{color:#97a3b2}
@@ -1008,7 +247,7 @@ hr{border:0;border-top:1px solid #1d232b;margin:16px 0}
 .progress{height:10px;background:#0b0f13;border:1px solid #27303b;border-radius:999px;overflow:hidden}
 .bar{height:100%;width:0%}
 footer{opacity:.7;font-size:12px;margin-top:12px}
-.help{font-size:12px;opacity:.85}
+.help{font-size:12px;opacity:.85;margin-top:6px}
 </style>
 </head>
 <body>
@@ -1035,6 +274,7 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
           </select>
         </div>
       </div>
+
       <div class="grid" style="margin-top:12px">
         <div>
           <label>Target column</label>
@@ -1050,12 +290,159 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
           </select>
         </div>
       </div>
-      <div class="row" style="margin-top:12px">
-        <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" v-model="dictFirst" style="width:auto">Use dictionary first for single words</label>
+
+      <div class="grid" style="margin-top:12px">
+        <div>
+          <label>Source language</label>
+          <select v-model="srcLang">
+            <option value="nob_Latn">Norwegian Bokmål (nob_Latn)</option>
+            <option value="nno_Latn">Norwegian Nynorsk (nno_Latn)</option>
+            <option value="eng_Latn">English (eng_Latn)</option>
+            <option value="fin_Latn">Finnish (fin_Latn)</option>
+            <option value="swe_Latn">Swedish (swe_Latn)</option>
+            <option value="dan_Latn">Danish (dan_Latn)</option>
+            <option value="deu_Latn">German (deu_Latn)</option>
+            <option value="fra_Latn">French (fra_Latn)</option>
+            <option value="nld_Latn">Dutch (nld_Latn)</option>
+            <option value="spa_Latn">Spanish (spa_Latn)</option>
+            <option value="ita_Latn">Italian (ita_Latn)</option>
+            <option value="pol_Latn">Polish (pol_Latn)</option>
+            <option value="est_Latn">Estonian (est_Latn)</option>
+            <option value="lit_Latn">Lithuanian (lit_Latn)</option>
+            <option value="lvs_Latn">Latvian (lvs_Latn)</option>
+            <option value="ces_Latn">Czech (ces_Latn)</option>
+            <option value="slk_Latn">Slovak (slk_Latn)</option>
+            <option value="ron_Latn">Romanian (ron_Latn)</option>
+            <option value="rus_Cyrl">Russian (rus_Cyrl)</option>
+            <option value="ukr_Cyrl">Ukrainian (ukr_Cyrl)</option>
+            <option value="zho_Hans">Chinese Hans (zho_Hans)</option>
+            <option value="jpn_Jpan">Japanese (jpn_Jpan)</option>
+            <option value="kor_Hang">Korean (kor_Hang)</option>
+            <option value="tur_Latn">Turkish (tur_Latn)</option>
+            <option value="en">English m2m (en)</option>
+            <option value="no">Norwegian m2m (no)</option>
+            <option value="fi">Finnish m2m (fi)</option>
+            <option value="sv">Swedish m2m (sv)</option>
+            <option value="da">Danish m2m (da)</option>
+            <option value="de">German m2m (de)</option>
+            <option value="fr">French m2m (fr)</option>
+            <option value="nl">Dutch m2m (nl)</option>
+            <option value="es">Spanish m2m (es)</option>
+            <option value="it">Italian m2m (it)</option>
+            <option value="pl">Polish m2m (pl)</option>
+          </select>
+        </div>
+        <div>
+          <label>Target language</label>
+          <select v-model="tgtLang">
+            <option value="eng_Latn">English (eng_Latn)</option>
+            <option value="nob_Latn">Norwegian Bokmål (nob_Latn)</option>
+            <option value="nno_Latn">Norwegian Nynorsk (nno_Latn)</option>
+            <option value="fin_Latn">Finnish (fin_Latn)</option>
+            <option value="swe_Latn">Swedish (swe_Latn)</option>
+            <option value="dan_Latn">Danish (dan_Latn)</option>
+            <option value="deu_Latn">German (deu_Latn)</option>
+            <option value="fra_Latn">French (fra_Latn)</option>
+            <option value="nld_Latn">Dutch (nld_Latn)</option>
+            <option value="spa_Latn">Spanish (spa_Latn)</option>
+            <option value="ita_Latn">Italian (ita_Latn)</option>
+            <option value="pol_Latn">Polish (pol_Latn)</option>
+            <option value="est_Latn">Estonian (est_Latn)</option>
+            <option value="lit_Latn">Lithuanian (lit_Latn)</option>
+            <option value="lvs_Latn">Latvian (lvs_Latn)</option>
+            <option value="ces_Latn">Czech (ces_Latn)</option>
+            <option value="slk_Latn">Slovak (slk_Latn)</option>
+            <option value="ron_Latn">Romanian (ron_Latn)</option>
+            <option value="rus_Cyrl">Russian (rus_Cyrl)</option>
+            <option value="ukr_Cyrl">Ukrainian (ukr_Cyrl)</option>
+            <option value="zho_Hans">Chinese Hans (zho_Hans)</option>
+            <option value="jpn_Jpan">Japanese (jpn_Jpan)</option>
+            <option value="kor_Hang">Korean (kor_Hang)</option>
+            <option value="tur_Latn">Turkish (tur_Latn)</option>
+            <option value="en">English m2m (en)</option>
+            <option value="no">Norwegian m2m (no)</option>
+            <option value="fi">Finnish m2m (fi)</option>
+            <option value="sv">Swedish m2m (sv)</option>
+            <option value="da">Danish m2m (da)</option>
+            <option value="de">German m2m (de)</option>
+            <option value="fr">French m2m (fr)</option>
+            <option value="nl">Dutch m2m (nl)</option>
+            <option value="es">Spanish m2m (es)</option>
+            <option value="it">Italian m2m (it)</option>
+            <option value="pl">Polish m2m (pl)</option>
+          </select>
+        </div>
       </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div>
+          <label>Model</label>
+          <select v-model="model">
+            <option v-for="m in models" :key="m" :value="m">{{m}}</option>
+          </select>
+          <div class="help">Pick which translation model to use.</div>
+        </div>
+        <div>
+          <label>Quality preset</label>
+          <select v-model="preset" @change="applyPreset">
+            <option value="accurate">Accurate - safe</option>
+            <option value="balanced">Balanced</option>
+            <option value="creative">Creative</option>
+          </select>
+          <div class="help">Choose how cautious or free the output should be.</div>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div>
+          <label>Max new tokens</label>
+          <input type="number" min="4" max="256" v-model.number="maxNew">
+          <div class="help">Upper limit for how many tokens the model adds.</div>
+        </div>
+        <div>
+          <label>Beams</label>
+          <input type="number" min="1" max="8" v-model.number="beams">
+          <div class="help">Higher is more careful and consistent. 1 is fastest. Set to 1 when Temperature is above 0.</div>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div>
+          <label>Temperature</label>
+          <input type="number" step="0.1" min="0" max="2" v-model.number="temperature">
+          <div class="help">0 is strict and literal. Higher adds variation. 0.5 to 0.9 gives more creative wording.</div>
+        </div>
+        <div>
+          <label>Top-p</label>
+          <input type="number" step="0.05" min="0.1" max="1" v-model.number="topP">
+          <div class="help">Limits how adventurous sampling is. 1 keeps all options. 0.9 narrows choices when Temperature is above 0.</div>
+        </div>
+      </div>
+
+      <hr>
+
+      <div class="grid">
+        <div>
+          <label>Upload glossary (TSV or CSV, two columns)</label>
+          <input type="file" @change="onLex" accept=".tsv,.csv,.txt" />
+          <div class="row">
+            <button :disabled="!lex || !token" @click="uploadLexicon">Upload glossary</button>
+            <div class="badge" v-if="lexCount>0">{{lexCount}} entries</div>
+          </div>
+        </div>
+        <div>
+          <label>Glossary mode</label>
+          <select v-model="glossaryMode">
+            <option value="off">Off</option>
+            <option value="replace">Replace after MT</option>
+          </select>
+          <div class="help">Optional replacements applied after translation. Use for fixed terminology.</div>
+        </div>
+      </div>
+
       <hr>
       <div class="row" v-if="jobId">
-        <div class="progress" style="flex:1"><div class="bar" :style="{width: progressPct+'%', background: downloading? '#444' : '#2f6feb'}"></div></div>
+        <div class="progress" style="flex:1"><div class="bar" :style="{width: progressPct+'%', background: '#2f6feb'}"></div></div>
         <div class="badge">{{stage}} {{done}}/{{total}}</div>
       </div>
       <div class="notice help" v-if="jobId">{{ explain }}</div>
@@ -1063,7 +450,7 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
         <button :disabled="!readyToTranslate || loading || jobId" @click="start">Translate</button>
         <div class="badge" v-if="status">{{status}}</div>
       </div>
-      <small>Source: Wiktionary via Wiktextract on kaikki.org</small>
+      <small>Pure MT with code preservation</small>
     </div>
   </div>
   <footer>{{ notice }}</footer>
@@ -1071,48 +458,85 @@ footer{opacity:.7;font-size:12px;margin-top:12px}
 <script src="https://unpkg.com/vue@3"></script>
 <script>
 const app = Vue.createApp({
-  data(){return{file:null,token:null,sheets:[],sheet:null,columns:[],srcCol:null,tgtCol:null,mode:"append_new",srcLang:"nb",tgtLang:"en",status:"",loading:false,downloading:false,timer:null,jobId:null,progressPct:0,done:0,total:0,stage:"",dictFirst:true,models:[],transStartTs:null,elapsedSec:0}},
+  data(){return{
+    file:null,token:null,sheets:[],sheet:null,columns:[],srcCol:null,tgtCol:null,mode:"append_new",
+    srcLang:"nob_Latn",tgtLang:"eng_Latn",status:"",loading:false,jobId:null,progressPct:0,done:0,total:0,stage:"",
+    models:[],model:null,maxNew:64,beams:4,temperature:0,topP:1.0,
+    preset:"accurate",
+    lex:null,lexCount:0,glossaryMode:"off"
+  }},
   computed:{
     readyToTranslate(){return this.token&&this.sheet&&this.srcCol&&this.tgtCol},
-    notice(){const m=this.models&&this.models.length?this.models.join(", "):(this.model||"facebook/nllb-200-distilled-600M");return m+" + Wiktextract + DP splitter"},
+    notice(){const m=this.models&&this.models.length?this.models.join(", "):(this.model||"");return m||"No models configured"},
     explain(){
       if(!this.jobId) return "";
-      if(this.stage==="loading") return "Reading workbook and scanning columns.";
-      if(this.stage==="downloading") return "Preparing dictionary index.";
-      if(this.stage==="translating"){
-        const q=this.total||0;const d=this.done||0;const r=q>0?Math.max(0,q-d):0;
-        const elapsed=this.elapsedSec;const rate=d>0?d/Math.max(1,elapsed):0;
-        const ipm=rate>0?(rate*60).toFixed(1):"";
-        const dur=this.formatTime(elapsed);
-        const mode=this.dictFirst?"dictionary first + MT":"machine translation only";
-        return "Translating "+q+" unique values from "+this.srcLang+" to "+this.tgtLang+" using "+mode+". "+d+" done, "+r+" remaining · elapsed "+dur+(ipm? " · ~"+ipm+" items/min":"");
-      }
-      if(this.stage==="writing") return "Writing results to sheet "+this.sheet+" in column "+this.tgtCol+".";
-      if(this.stage==="done") return "Finished. Your translated file is being downloaded.";
-      if(this.stage==="error") return "An error occurred. See status for details.";
-      return "";
+      if(this.stage==="translating") return "Working through unique values."
+      if(this.stage==="writing") return "Writing results to the workbook."
+      if(this.stage==="done") return "Finished."
+      return ""
     }
   },
   methods:{
-    formatTime(s){const m=Math.floor(s/60);const sec=(s%60).toString().padStart(2,"0");return m+":"+sec},
-    async refreshStatus(){try{const r=await fetch("/status");if(!r.ok)return;const j=await r.json();this.models=j.models||[];this.model=j.model||null}catch(e){}},
-    onFile(e){this.file=e.target.files[0];this.token=null;this.sheets=[];this.columns=[];this.srcCol=null;this.tgtCol=null},
-    async inspect(){if(!this.file)return;this.loading=true;this.status="Inspecting";const fd=new FormData();fd.append("file",this.file);const r=await fetch("/inspect",{method:"POST",body:fd});if(!r.ok){this.status="Failed to read file";this.loading=false;return}const j=await r.json();this.token=j.token;this.sheets=j.sheets;this.sheet=j.sheets[0]||null;this.columns=j.columns||[];this.srcCol=this.columns[0]||null;this.tgtCol=this.srcCol?this.srcCol+"_en":null;this.status="Ready";this.loading=false},
-    async fetchColumns(){if(!this.token||!this.sheet)return;this.loading=true;this.status="Loading columns";const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);const r=await fetch("/columns",{method:"POST",body:fd});if(!r.ok){this.status="Failed to load columns";this.loading=false;return}const j=await r.json();this.columns=j.columns||[];if(!this.srcCol)this.srcCol=this.columns[0]||null;this.status="Ready";this.loading=false},
-    async start(){this.status="Starting";this.transStartTs=null;this.elapsedSec=0;const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);fd.append("src_col",this.srcCol);fd.append("tgt_col",this.tgtCol);fd.append("src_lang",this.srcLang);fd.append("tgt_lang",this.tgtLang);fd.append("mode",this.mode);fd.append("dict_first",this.dictFirst?"true":"false");const r=await fetch("/start",{method:"POST",body:fd});if(!r.ok){this.status="Failed to start";return}const j=await r.json();this.jobId=j.job;this.status="Translating";this.poll()},
+    applyPreset(){
+      if(this.preset==="accurate"){this.beams=6;this.temperature=0;this.topP=1.0;if(this.maxNew<64)this.maxNew=64}
+      if(this.preset==="balanced"){this.beams=4;this.temperature=0.3;this.topP=0.9;if(this.maxNew<64)this.maxNew=64}
+      if(this.preset==="creative"){this.beams=1;this.temperature=0.8;this.topP=0.9;if(this.maxNew<128)this.maxNew=128}
+    },
+    async refreshStatus(){try{const r=await fetch("/status");if(!r.ok)return;const j=await r.json();this.models=j.models||[];this.model=j.model||this.models[0]||null}catch(e){}},
+    onFile(e){this.file=e.target.files[0];this.token=null;this.sheets=[];this.columns=[];this.srcCol=null;this.tgtCol=null;this.lex=null;this.lexCount=0},
+    onLex(e){this.lex=e.target.files[0]},
+    async uploadLexicon(){
+      if(!this.lex||!this.token)return;
+      const fd=new FormData();
+      fd.append("token",this.token);
+      fd.append("file",this.lex);
+      const r=await fetch("/upload_lexicon",{method:"POST",body:fd});
+      if(!r.ok)return;
+      const j=await r.json();
+      this.lexCount=j.count||0
+    },
+    async inspect(){
+      if(!this.file)return;
+      this.loading=true;this.status="Inspecting";
+      const fd=new FormData();fd.append("file",this.file);
+      const r=await fetch("/inspect",{method:"POST",body:fd});
+      if(!r.ok){this.status="Failed to read file";this.loading=false;return}
+      const j=await r.json();
+      this.token=j.token;this.sheets=j.sheets;this.sheet=j.sheets[0]||null;this.columns=j.columns||[];
+      this.srcCol=this.columns[0]||null;this.tgtCol=this.srcCol?this.srcCol+"_tr":null;this.status="Ready";this.loading=false
+    },
+    async fetchColumns(){
+      if(!this.token||!this.sheet)return;
+      this.loading=true;this.status="Loading columns";
+      const fd=new FormData();fd.append("token",this.token);fd.append("sheet",this.sheet);
+      const r=await fetch("/columns",{method:"POST",body:fd});
+      if(!r.ok){this.status="Failed to load columns";this.loading=false;return}
+      const j=await r.json();this.columns=j.columns||[];if(!this.srcCol)this.srcCol=this.columns[0]||null;this.status="Ready";this.loading=false
+    },
+    async start(){
+      this.status="Starting";
+      const fd=new FormData();
+      fd.append("token",this.token);fd.append("sheet",this.sheet);
+      fd.append("src_col",this.srcCol);fd.append("tgt_col",this.tgtCol);
+      fd.append("src_lang",this.srcLang);fd.append("tgt_lang",this.tgtLang);
+      fd.append("mode",this.mode);fd.append("model",this.model||"");
+      fd.append("max_new",String(this.maxNew));fd.append("beams",String(this.beams));
+      fd.append("temperature",String(this.temperature));fd.append("top_p",String(this.topP));
+      fd.append("glossary_mode",this.glossaryMode);
+      const r=await fetch("/start",{method:"POST",body:fd});
+      if(!r.ok){this.status="Failed to start";return}
+      const j=await r.json();this.jobId=j.job;this.status="Translating";this.poll()
+    },
     async poll(){
       if(!this.jobId)return;
       const r=await fetch(`/job?job=${this.jobId}`);
       if(!r.ok){this.status="Job error";return}
       const j=await r.json();
-      this.stage=j.stage;this.done=j.done;this.total=j.total;this.downloading=j.stage==="downloading";
+      this.stage=j.stage;this.done=j.done;this.total=j.total;
       this.progressPct=j.total?Math.min(100,Math.round(100*j.done/j.total)):(j.stage==="done"?100:0);
-      if(this.stage==="translating"){if(!this.transStartTs)this.transStartTs=Date.now();this.elapsedSec=Math.floor((Date.now()-this.transStartTs)/1000)}
-      else{this.transStartTs=null;this.elapsedSec=0}
       if(j.stage==="done"){
         const d=await fetch(`/download?job=${this.jobId}`);
-        const blob=await d.blob();
-        const url=URL.createObjectURL(blob);
+        const blob=await d.blob();const url=URL.createObjectURL(blob);
         const a=document.createElement("a");a.href=url;a.download="translated.xlsx";document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
         this.status="Downloaded";this.jobId=null;return
       }
@@ -1120,17 +544,9 @@ const app = Vue.createApp({
       setTimeout(this.poll,500)
     }
   },
-  mounted(){this.refreshStatus()}
+  mounted(){this.refreshStatus();this.applyPreset()}
 })
 app.mount("#app")
-fetch("/status").then(r=>r.json()).then(j=>{
-  const m = (j.models && j.models.length ? j.models.join(", ") : (j.model || "facebook/nllb-200-distilled-600M"));
-  const txt = m + " + Wiktextract + DP splitter";
-  const b = document.getElementById("banner");
-  const f = document.getElementById("footer");
-  if (b) b.textContent = txt;
-  if (f) f.textContent = txt;
-});
 </script>
 </body>
 </html>
@@ -1138,51 +554,27 @@ fetch("/status").then(r=>r.json()).then(j=>{
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _ready, _downloading
+    global _ready
     _ready = True
-    _downloading = False
-    def _warm_models():
+    def _warm():
         try:
-            translate_one("hei", "nob_Latn", "eng_Latn", max_new=4, beams=2)
+            mid, mdl, tok = get_model()
+            batch_gen(mid, mdl, tok, ["hei"], "nob_Latn", "eng_Latn", max_new=4)
         except Exception:
             pass
-    threading.Thread(target=_warm_models, daemon=True).start()
+    threading.Thread(target=_warm, daemon=True).start()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/status")
-def status():
-    ds = os.path.getsize(DICT_IDX) if os.path.exists(DICT_IDX) else 0
-    mids = get_model_ids()
-    return {"ready": _ready, "downloading": _downloading, "models": mids, "dict_index_bytes": ds}
-
-@app.post("/clear_cache")
-def clear_cache():
-    try:
-        if os.path.exists(_cache_path):
-            os.remove(_cache_path)
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/dict_test")
-def dict_test(term: str):
-    try:
-        ensure_nb_dict()
-        d = dict_lookup(term)
-        src = norm_lang("nb")
-        tgt = norm_lang("en")
-        mt = translate_one(term, src, tgt)
-        comp, exact = split_compound(term)
-        fuzz = dict_fuzzy(term) if not d else None
-        return {"term": term, "dict": d, "compound": comp, "compound_exact": exact, "fuzzy": fuzz, "mt": mt}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
 @app.get("/", response_class=HTMLResponse)
 def index():
     return index_html()
+
+@app.get("/status")
+def status():
+    mids = get_model_ids()
+    return {"ready": _ready, "models": mids, "model": mids[0] if mids else None}
 
 @app.post("/inspect")
 async def inspect(file: UploadFile):
@@ -1213,58 +605,77 @@ async def columns(token: str = Form(...), sheet: str = Form(...)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, dict_first):
+@app.post("/upload_lexicon")
+async def upload_lexicon(token: str = Form(...), file: UploadFile = File(...)):
+    if token not in _files:
+        return JSONResponse({"error": "Invalid token"}, status_code=400)
+    try:
+        raw = await file.read()
+        txt = raw.decode("utf-8-sig", errors="ignore")
+        pairs = []
+        for line in txt.splitlines():
+            if not line.strip():
+                continue
+            if "\t" in line:
+                a, b = line.rstrip("\n").split("\t", 1)
+            elif "," in line:
+                a, b = line.rstrip("\n").split(",", 1)
+            else:
+                continue
+            a = a.strip()
+            b = b.strip()
+            if a and b:
+                pairs.append((a, b))
+        pairs.sort(key=lambda x: len(x[0]), reverse=True)
+        _glossaries[token] = pairs
+        return {"ok": True, "count": len(pairs)}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, model_id, max_new, beams, temperature, top_p, glossary_mode):
     try:
         _jobs[job]["stage"] = "loading"
         xf = pd.ExcelFile(io.BytesIO(_files[token]))
         df = xf.parse(sheet)
         if src_col not in df.columns:
-            _jobs[job]["stage"] = "error"
-            _jobs[job]["error"] = "Missing source column"
-            return
+            _jobs[job]["stage"] = "error"; _jobs[job]["error"] = "Missing source column"; return
         if tgt_col not in df.columns:
             df[tgt_col] = ""
         else:
             df[tgt_col] = df[tgt_col].fillna("")
-        if dict_first:
-            _jobs[job]["stage"] = "downloading"
-            try:
-                ensure_nb_dict()
-            except Exception as e:
-                _jobs[job]["dict_error"] = str(e)
         cache = load_cache()
         src_vals = df[src_col].fillna("").astype(str)
         tgt_vals = df[tgt_col].fillna("").astype(str)
-        todo_idx = []
-        todo_texts = []
+        todo_idx, todo_texts = [], []
         for i, (s, t) in enumerate(zip(src_vals, tgt_vals)):
             s2 = s.strip()
-            if s2 == "":
-                continue
-            if s2.startswith("="):
+            if s2 == "" or s2.startswith("="):
                 continue
             if mode == "skip_filled" and t.strip() != "":
                 continue
             if mode == "append_new" and t.strip() != "":
                 continue
-            if s2 not in cache:
+            key = f"{CACHE_VER}|{src_lang}|{tgt_lang}|{s2}"
+            if key not in cache:
                 todo_texts.append(s2)
             todo_idx.append(i)
         uniq = list(dict.fromkeys(todo_texts))
         _jobs[job]["total"] = max(len(uniq), 1)
+        pairs = _glossaries.get(token) if glossary_mode == "replace" else None
         if uniq:
             _jobs[job]["stage"] = "translating"
-            src_code = norm_lang(src_lang)
-            tgt_code = norm_lang(tgt_lang)
-            outs = translate_many(uniq, src_code, tgt_code, dict_first)
+            outs = translate_many(uniq, src_lang, tgt_lang, model_id=model_id, max_new=max_new, beams=beams, temperature=temperature, top_p=top_p)
             for i, s in enumerate(uniq, 1):
-                cache[s] = outs[i-1]
+                y = outs[i-1]
+                if pairs:
+                    y = apply_glossary(y, pairs)
+                cache[f"{CACHE_VER}|{src_lang}|{tgt_lang}|{s}"] = y
                 _jobs[job]["done"] = i
             save_cache(cache)
         _jobs[job]["stage"] = "writing"
         for i in todo_idx:
             s2 = src_vals.iat[i].strip()
-            df.at[i, tgt_col] = cache.get(s2, "")
+            df.at[i, tgt_col] = cache.get(f"{CACHE_VER}|{src_lang}|{tgt_lang}|{s2}", "")
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
             for sh in xf.sheet_names:
@@ -1275,19 +686,31 @@ def run_job(job, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, dict_
         bio.seek(0)
         _jobs[job]["result"] = bio.read()
         _jobs[job]["stage"] = "done"
-        clear_cache_file()
     except Exception as e:
         _jobs[job]["stage"] = "error"
         _jobs[job]["error"] = str(e)
 
 @app.post("/start")
-async def start(token: str = Form(...), sheet: str = Form(...), src_col: str = Form(...), tgt_col: str = Form(...), src_lang: str = Form(...), tgt_lang: str = Form(...), mode: str = Form("append_new"), dict_first: str = Form("true")):
+async def start(
+    token: str = Form(...),
+    sheet: str = Form(...),
+    src_col: str = Form(...),
+    tgt_col: str = Form(...),
+    src_lang: str = Form(...),
+    tgt_lang: str = Form(...),
+    mode: str = Form("append_new"),
+    model: str = Form(None),
+    max_new: int = Form(64),
+    beams: int = Form(4),
+    temperature: float = Form(0.0),
+    top_p: float = Form(1.0),
+    glossary_mode: str = Form("off")
+):
     if token not in _files:
         return JSONResponse({"error": "Invalid token"}, status_code=400)
     j = str(uuid.uuid4())
     _jobs[j] = {"stage": "queued", "done": 0, "total": 0}
-    use_dict = str(dict_first).lower() == "true"
-    t = threading.Thread(target=run_job, args=(j, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, use_dict), daemon=True)
+    t = threading.Thread(target=run_job, args=(j, token, sheet, src_col, tgt_col, src_lang, tgt_lang, mode, model, max_new, beams, temperature, top_p, glossary_mode), daemon=True)
     t.start()
     return {"job": j}
 
